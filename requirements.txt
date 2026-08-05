@@ -1,25 +1,9 @@
-discord
-discord_interactions
-typing
-google-generativeai
-requests
-aiohttp
-BeautifulSoup4
-search_engine_tool_vito1317
-python-dotenv
-gtts
-pyttsx3
-google-cloud-texttospeech
-google-cloud-speech
-torchaudio
-edge_tts
-SpeechRecognition
-py-cord
-discord-ext-voice-recv[extras]
-discord.py[voice]==2.5.2
-soundfile
-google.cloud.speech_v1
-gapic-google-cloud-speech-v1
-whisper
-pyaudio
-git+https://github.com/imayhaveborkedit/discord-ext-voice-recv.git
+# 核心
+py-cord[voice]>=2.6.0
+openai>=1.0.0
+python-dotenv>=1.0.0
+
+# 語音橋接（Freeze-Omni）
+python-socketio[client]>=5.0
+websocket-client>=1.0
+numpy>=1.24

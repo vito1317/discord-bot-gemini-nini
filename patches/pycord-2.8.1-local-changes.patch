@@ -1,0 +1,232 @@
+diff -ru '--exclude=__pycache__' /tmp/claude-0/-home-vito-nana-bot/aa1dcabd-0608-4efa-99f1-2f1a61353ffd/scratchpad/v281/ex/discord/voice/receive/reader.py venv/lib/python3.13/site-packages/discord/voice/receive/reader.py
+--- /tmp/claude-0/-home-vito-nana-bot/aa1dcabd-0608-4efa-99f1-2f1a61353ffd/scratchpad/v281/ex/discord/voice/receive/reader.py	2026-07-25 16:39:20.000000000 +0800
++++ venv/lib/python3.13/site-packages/discord/voice/receive/reader.py	2026-08-04 23:00:56.909929244 +0800
+@@ -243,6 +243,74 @@
+                 self.stop()
+ 
+ 
++_HEX_N = [0]
++_PT_N = [0]
++
++
++def _pt_hex(b: bytes) -> None:
++    """印未加密(passthrough)音框的前幾個位元組，確認是否為合法 opus。"""
++    if _PT_N[0] >= 10:
++        return
++    _PT_N[0] += 1
++    _log.info("🔸 passthrough #%02d len=%d %s [%s]",
++              _PT_N[0], len(b), _looks_like_opus(b), b[:12].hex(" "))
++
++
++def _looks_like_opus(b: bytes) -> str:
++    """粗略判斷是不是合法 opus 開頭。
++
++    Opus 的第一個 byte 是 TOC：高 5 bits 是 config(0-31)，bit2 是 stereo，
++    低 2 bits 是 frame count code。Discord 語音常見 0x78/0xb8/0xfc，
++    靜音框固定是 F8 FF FE。
++    """
++    if not b:
++        return "空"
++    if b[:3] == b"\xf8\xff\xfe":
++        return "靜音框"
++    toc = b[0]
++    cfg = toc >> 3
++    return f"TOC=0x{toc:02x} config={cfg} {'合理' if cfg >= 12 else '可疑'}"
++
++
++def _hexdump_stages(packet, raw_payload, dave_out, offset, stripped) -> None:
++    """一次性把各階段前 12 bytes 印出來（只印前 20 個封包）。"""
++    if _HEX_N[0] >= 20:
++        return
++    _HEX_N[0] += 1
++    _log.info(
++        "🔬 #%02d ext=%s │ 傳輸層出來 len=%d %s [%s] │ dave出來 len=%d %s [%s] "
++        "│ offset=%s │ 剝完 len=%d %s [%s]",
++        _HEX_N[0], packet.extended,
++        len(raw_payload), _looks_like_opus(raw_payload), raw_payload[:12].hex(" "),
++        len(dave_out), _looks_like_opus(dave_out), dave_out[:12].hex(" "),
++        offset,
++        len(stripped), _looks_like_opus(stripped), stripped[:12].hex(" "),
++    )
++
++
++def _strip_ext(packet, data: bytes) -> bytes:
++    """剝除 dave.decrypt() 結果前面的 RTP 擴充標頭（沿用上游 2.8.1 行為）。"""
++    if packet.extended:
++        offset = packet.update_extended_header(data)
++        return data[offset:]
++    return data
++
++
++# ── DAVE 解密統計（本地加裝的診斷）──
++_DAVE_STATS: dict[str, int] = {}
++
++
++def _dave_stat(kind: str) -> None:
++    _DAVE_STATS[kind] = _DAVE_STATS.get(kind, 0) + 1
++    total = sum(_DAVE_STATS.values())
++    if total % 250 == 0:
++        good = sum(_DAVE_STATS.get(k, 0)
++                   for k in ("ok", "ok_probe", "passthrough"))
++        _log.info("DAVE 解密：%d 個封包，可用 %d (%.0f%%) │ %s",
++                  total, good, good / total * 100,
++                  ", ".join(f"{k}={v}" for k, v in sorted(_DAVE_STATS.items())))
++
++
+ class PacketDecryptor:
+     supported_modes: list[SupportedModes] = [
+         "aead_xchacha20_poly1305_rtpsize",
+@@ -295,24 +363,75 @@
+ 
+         if dave is not None and dave.ready:
+             uid = state.ssrc_user_map.get(packet.ssrc)
+-            if uid:
++            probed = None
++
++            if not uid:
++                # 本地修改①：SSRC→user_id 對映還沒建立時（與 member_connect 競態），
++                # 試遍 DAVE session 裡已知的 user id，哪個解得開就是它。
++                # 上游在 uid 為空時直接跳過整個封包 → 開頭幾百毫秒全丟。
++                for candidate in dave.get_user_ids():
++                    try:
++                        probed = dave.decrypt(
++                            candidate, davey.MediaType.audio, raw_payload
++                        )
++                    except Exception:
++                        continue
++                    state.user_ssrc_map[candidate] = packet.ssrc
++                    uid = candidate
++                    _log.debug("DAVE: 由解密結果推得 ssrc %s → user %s",
++                               packet.ssrc, uid)
++                    break
++
++            if probed is not None:
++                # 本地修改②：暴力比對時已經解好了，**不能再解一次**。
++                # 再解必定失敗並落到 OPUS_SILENCE，等於白丟一個封包。
++                # 同樣不剝標頭（見下方說明）。
++                packet.decrypted_data = probed
++                _dave_stat("ok_probe")
++            elif uid:
+                 try:
+                     decrypted_audio = dave.decrypt(
+                         uid,
+                         davey.MediaType.audio,
+                         raw_payload,
+                     )
+-
+-                    if packet.extended:
+-                        offset = packet.update_extended_header(decrypted_audio)
+-                        packet.decrypted_data = decrypted_audio[offset:]
+-                    else:
+-                        packet.decrypted_data = decrypted_audio
++                    # 擴充標頭必須剝（沿用上游 2.8.1 的處理）。
++                    # 曾試過不剝，結果 opus 立刻報 "corrupted stream" ——
++                    # 證明 2.8.1 的傳輸層並未替 DAVE 內層把它切掉。
++                    # 不剝擴充標頭 —— 位元組層級實測證明 dave.decrypt() 的
++                    # 輸出已經是純 opus：每包都以 TOC 0x48（config 9 =
++                    # SILK 寬頻 20ms）開頭，而且有的封包整包只有 8 bytes，
++                    # 再剝 8 就變成空的。上游的 update_extended_header()
++                    # 是把 opus 資料誤判成標頭，固定回傳 8。
++                    _hexdump_stages(packet, raw_payload, decrypted_audio,
++                                    0, decrypted_audio)
++                    packet.decrypted_data = decrypted_audio
++                    _dave_stat("ok")
+                 except Exception as exc:
+-                    _log.debug(
+-                        "Ignoring exception while decoding DAVE packet", exc_info=exc
+-                    )
+-                    packet.decrypted_data = OPUS_SILENCE
++                    exc_str = str(exc)
++                    if "UnencryptedWhenPassthroughDisabled" in exc_str:
++                        # **不要**用 raw_payload。位元組實測顯示傳輸層出來的
++                        # 資料仍是 DAVE 加密狀態（長度比解密後多 13 bytes、
++                        # 內容看起來隨機），拿它當 opus 就是往音訊裡灌噪音，
++                        # 那正是 "corrupted stream" 的來源。
++                        # 這類封包只能當丟失處理，用靜音保住時間軸。
++                        # 位元組實測結論：這些音框**仍是加密狀態**。
++                        # 正常解密出來的封包 TOC 固定為 0x48（opus 模式不變），
++                        # 但這些的第一個 byte 每包都不同（0x30/0x0d/0xb4/…）
++                        # ＝ 隨機資料。拿它當 opus 會灌噪音、解碼器報錯。
++                        # 只能當丟包處理，用靜音框保住時間軸。
++                        _pt_hex(raw_payload)
++                        packet.decrypted_data = OPUS_SILENCE
++                        _dave_stat("undecryptable")
++                    else:
++                        _log.debug(
++                            "Ignoring exception while decoding DAVE packet",
++                            exc_info=exc,
++                        )
++                        packet.decrypted_data = OPUS_SILENCE
++                        _dave_stat("fail")
++            else:
++                _dave_stat("no_uid")
+ 
+         return packet.decrypted_data
+ 
+diff -ru '--exclude=__pycache__' /tmp/claude-0/-home-vito-nana-bot/aa1dcabd-0608-4efa-99f1-2f1a61353ffd/scratchpad/v281/ex/discord/voice/receive/router.py venv/lib/python3.13/site-packages/discord/voice/receive/router.py
+--- /tmp/claude-0/-home-vito-nana-bot/aa1dcabd-0608-4efa-99f1-2f1a61353ffd/scratchpad/v281/ex/discord/voice/receive/router.py	2026-07-25 16:39:20.000000000 +0800
++++ venv/lib/python3.13/site-packages/discord/voice/receive/router.py	2026-08-04 22:36:54.797647465 +0800
+@@ -47,6 +47,9 @@
+ 
+ _log = logging.getLogger(__name__)
+ 
++# 診斷：解碼器 pop 結果分布（本地加裝）
++_POP_STATS: dict[str, int] = {}
++
+ 
+ class PacketRouter(threading.Thread):
+     def __init__(self, sink: Sink, reader: AudioReader) -> None:
+@@ -130,9 +133,29 @@
+ 
+             with self._lock:
+                 for decoder in self.waiter.items:
+-                    data = decoder.pop_data()
+-                    if data is not None:
+-                        self.sink.write(data, data.source)
++                    # 本地修改：包住 pop_data / sink.write。
++                    # 上游沒有 try，單一壞封包丟出的 OpusError 會冒到 run()
++                    # 的 except，整個 router 執行緒結束、錄音停止且不自動恢復
++                    # —— 症狀是語音突然完全沒反應。這裡只記錄並跳過該封包。
++                    try:
++                        data = decoder.pop_data()
++                        _POP_STATS["none" if data is None else "data"] = (
++                            _POP_STATS.get("none" if data is None else "data", 0) + 1
++                        )
++                        _total = sum(_POP_STATS.values())
++                        if _total % 500 == 0:
++                            _log.info(
++                                "解碼器 pop_data：%d 次 │ 有資料 %d │ None %d │ 錯誤 %d",
++                                _total, _POP_STATS.get("data", 0),
++                                _POP_STATS.get("none", 0), _POP_STATS.get("error", 0),
++                            )
++                        if data is not None:
++                            self.sink.write(data, data.source)
++                    except Exception as exc:
++                        _POP_STATS["error"] = _POP_STATS.get("error", 0) + 1
++                        if _POP_STATS["error"] in (1, 10, 100, 1000):
++                            _log.warning("跳過無法處理的音訊封包（累計 %d）：%s",
++                                         _POP_STATS["error"], exc)
+ 
+ 
+ class SinkEventRouter(threading.Thread):
+Only in venv/lib/python3.13/site-packages/discord/voice/receive: router.py.bak
+diff -ru '--exclude=__pycache__' /tmp/claude-0/-home-vito-nana-bot/aa1dcabd-0608-4efa-99f1-2f1a61353ffd/scratchpad/v281/ex/discord/voice/state.py venv/lib/python3.13/site-packages/discord/voice/state.py
+--- /tmp/claude-0/-home-vito-nana-bot/aa1dcabd-0608-4efa-99f1-2f1a61353ffd/scratchpad/v281/ex/discord/voice/state.py	2026-07-25 16:39:20.000000000 +0800
++++ venv/lib/python3.13/site-packages/discord/voice/state.py	2026-08-04 22:58:31.141293611 +0800
+@@ -924,6 +924,16 @@
+                     self.channel_id,
+                 )
+ 
++            # 本地修改：DAVE 啟用狀態也開 passthrough。
++            # 上游只在「降級」分支才呼叫（見下方 elif），但實測有 19% 的音框
++            # 以未加密方式抵達，撞上 UnencryptedWhenPassthroughDisabled 後
++            # 被當成失敗 → 音訊少掉 19% 的時間 → 語音辨識通順但聽錯字。
++            try:
++                self.dave_session.set_passthrough_mode(True, 10)
++                _log.info("DAVE: 已啟用 passthrough（放行未加密音框）")
++            except Exception as exc:  # noqa: BLE001
++                _log.warning("DAVE: passthrough 啟用失敗：%s", exc)
++
+             await self.ws.send_as_bytes(
+                 OpCodes.mls_key_package,
+                 self.dave_session.get_serialized_key_package(),

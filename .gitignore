@@ -1,0 +1,9 @@
+.env
+.env.bak*
+settings.json
+venv/
+__pycache__/
+*.pyc
+*.db
+logs/
+recordings/

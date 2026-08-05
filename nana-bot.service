@@ -1,0 +1,31 @@
+[Unit]
+Description=Nana Discord Bot 🌸
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vito
+Group=vito
+WorkingDirectory=/home/vito/nana-bot
+ExecStart=/home/vito/nana-bot/venv/bin/python main.py
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# 環境
+EnvironmentFile=/home/vito/nana-bot/.env
+
+# 日誌
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nana-bot
+
+# 安全性
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/vito/nana-bot
+
+[Install]
+WantedBy=multi-user.target
