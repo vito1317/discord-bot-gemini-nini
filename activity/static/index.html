@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>奈奈的操作台</title>
+
+<script>
+/* 這段一定要放在所有其他 script 前面。
+ *
+ * Activity 跑在 Discord 的 iframe 裡，外面看不到 console —— 前端只要在載入階段
+ * 掛掉，使用者看到的就只是一片黑，而黑畫面的可能原因有一堆（嵌入被 header 擋、
+ * sdk.js 沒載到、SDK handshake 卡住、授權失敗…），從 Discord 那端完全分不出來。
+ * 所以先把回報管道架好，之後每個階段都打一筆回後端，卡在哪一步直接看 log。 */
+(function () {
+  var API = "/.proxy/api";
+  window.__nlog = function (stage, msg, bad) {
+    try {
+      // 不要用 keepalive —— Android 的 webview 上實測整批回報都送不出去
+      // （桌面版正常），結果手機出問題時完全沒有線索可查。
+      fetch(API + "/clientlog", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          stage: stage,
+          msg: String(msg === undefined || msg === null ? "" : msg),
+          bad: !!bad,
+        }),
+      }).catch(function () {});
+    } catch (e) { /* 連回報都失敗就算了，別再往上炸 */ }
+  };
+  window.addEventListener("error", function (e) {
+    window.__nlog("js-error",
+      (e.message || "?") + " @ " + (e.filename || "?") + ":" + (e.lineno || 0), true);
+  });
+  window.addEventListener("unhandledrejection", function (e) {
+    var r = e.reason;
+    window.__nlog("promise-reject", (r && (r.message || r)) || "?", true);
+  });
+  window.__nlog("html-start", location.href.slice(0, 300));
+  document.addEventListener("DOMContentLoaded", function () {
+    window.__nlog("dom-ready", "DiscordSDK=" + (typeof window.DiscordSDK));
+  });
+})();
+</script>
+<style>
+  :root {
+    --bg: #1e1f22; --panel: #2b2d31; --line: #3f4147;
+    --fg: #dbdee1; --dim: #949ba4; --pink: #ffb7c5; --pink-d: #e88ea0;
+    --ok: #23a55a; --warn: #f0b232; --bad: #f23f43;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: "Noto Sans TC", "Segoe UI", system-ui, sans-serif;
+    height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    padding: 10px 14px; background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+  }
+  header h1 { margin: 0; font-size: 15px; }
+  header h1 span { color: var(--pink); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+  .dot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .grow { flex: 1; }
+  .meta { font-size: 12px; color: var(--dim); }
+
+  main { flex: 1; display: flex; min-height: 0; }
+  @media (max-width: 780px) { main { flex-direction: column; } }
+
+  #screen {
+    flex: 1; min-width: 0; background: #000;
+    display: flex; align-items: center; justify-content: center; position: relative;
+  }
+  #screen img { max-width: 100%; max-height: 100%; display: block; }
+  #screen .empty { color: var(--dim); font-size: 13px; padding: 20px; text-align: center; }
+  #badge {
+    position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,.65);
+    padding: 3px 8px; border-radius: 4px; font-size: 11px; color: var(--pink);
+  }
+
+  aside {
+    width: 340px; flex-shrink: 0; background: var(--panel);
+    border-left: 1px solid var(--line); display: flex; flex-direction: column;
+  }
+  @media (max-width: 780px) { aside { width: 100%; border-left: 0; border-top: 1px solid var(--line); max-height: 46%; } }
+
+  .box { padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  .box h2 { margin: 0 0 6px; font-size: 12px; color: var(--dim); font-weight: 600; }
+  #task { font-size: 13px; line-height: 1.5; word-break: break-word; }
+  #steps { flex: 1; overflow-y: auto; padding: 8px 12px; font-size: 12px; line-height: 1.6; }
+  #steps div { padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,.04); }
+  #steps b { color: var(--pink); font-weight: 600; }
+
+  .ask {
+    background: rgba(240,178,50,.12); border: 1px solid var(--warn);
+    border-radius: 6px; padding: 10px; margin: 10px 12px; font-size: 13px;
+  }
+  .row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  button {
+    font: inherit; font-size: 13px; padding: 7px 12px; border-radius: 5px;
+    border: 0; cursor: pointer; color: #fff; background: var(--line);
+  }
+  button:hover { filter: brightness(1.15); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.ok { background: var(--ok); }
+  button.warn { background: var(--warn); color: #000; }
+  button.bad { background: var(--bad); }
+  input[type=text] {
+    flex: 1; min-width: 120px; font: inherit; font-size: 13px; padding: 7px 9px;
+    border-radius: 5px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--fg);
+  }
+  #toast {
+    position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
+    background: var(--pink); color: #000; padding: 8px 16px; border-radius: 6px;
+    font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+  .hint { font-size: 11px; color: var(--dim); margin-top: 6px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<header>
+  <div class="dot" id="dot"></div>
+  <h1>🌸 <span>奈奈</span> 的操作台</h1>
+  <div class="grow"></div>
+  <div class="meta" id="meta">連線中…</div>
+</header>
+
+<main>
+  <div id="screen">
+    <div class="empty" id="empty">還沒有畫面</div>
+    <img id="img" style="display:none" alt="瀏覽器畫面">
+    <div id="badge" style="display:none"></div>
+  </div>
+
+  <aside>
+    <div class="box">
+      <h2>她在做的事</h2>
+      <div id="task">—</div>
+    </div>
+
+    <div id="ask" class="ask" style="display:none"></div>
+
+    <div class="box">
+      <h2>控制</h2>
+      <div class="row">
+        <button id="bManual" style="background:var(--pink);color:#000">🖐 我來操作</button>
+        <button id="bSound" disabled title="需要先跟奈奈在同一個語音頻道">🔊 接到語音</button>
+      </div>
+      <div class="hint" id="manualHint" style="display:none">
+        <b>你現在在直接操作那個瀏覽器</b> —— 點左邊畫面就是點網頁、滾輪可以捲動。
+        奈奈已經停下來等你。驗證碼、登入這種她過不去的，你自己來最快。
+      </div>
+      <div class="hint" id="typeHint" style="display:none">
+        打字是打進<b>網頁上目前選到的欄位</b> —— 先在左邊點一下那個輸入框，再打字。
+      </div>
+      <div class="row" id="typeRow" style="display:none">
+        <input type="text" id="fType" placeholder="打字送到網頁（先點好欄位，Enter 送出）">
+        <button id="bKeyEnter" title="把上面打的字送進網頁，並按 Enter">⏎ 送出</button>
+        <button id="bKeyTab">⇥</button>
+        <button id="bKeyBack">⌫</button>
+      </div>
+      <div class="row">
+        <button class="ok" id="bYes" disabled>✅ 確認送出</button>
+        <button class="warn" id="bAlways" disabled>🏃 一律允許</button>
+        <button id="bNo" disabled>✋ 不要送</button>
+        <button class="bad" id="bStop" disabled>⏹ 停止</button>
+      </div>
+      <div class="row">
+        <input type="text" id="fInput" placeholder="🔒 送資料給她（身分證、驗證碼…）">
+        <button id="bSend" disabled>送出</button>
+      </div>
+      <div class="hint">打在這裡的東西只有伺服器收到，<b>不會出現在頻道訊息裡</b>。</div>
+    </div>
+
+    <div class="box">
+      <h2>交代新任務</h2>
+      <div class="row">
+        <input type="text" id="fTask" placeholder="例如：掛台大心臟科下週三下午">
+        <button id="bTask">▶ 開始</button>
+      </div>
+    </div>
+
+    <h2 style="margin:10px 12px 0;font-size:12px;color:var(--dim)">她做過的步驟</h2>
+    <div id="steps"><div style="color:var(--dim)">—</div></div>
+  </aside>
+</main>
+
+<div id="toast"></div>
+
+<!-- client_id 必須由伺服器嵌進來 —— Discord 的 iframe 網址不帶它。
+     （沒有 redirect_uri：RPC 的 authorize 會自己用 App 已註冊的那筆，見 app.js） -->
+<script>window.__CLIENT_ID__ = "__NANA_CLIENT_ID__";</script>
+<!-- onerror：靜態檔載不到是黑畫面的常見死法（Discord 的代理不一定會把
+     非 /.proxy/ 的路徑轉回我們這邊），讓它自己講比對著黑畫面猜快得多 -->
+<!-- ?v= 是必要的：Discord 的代理會快取靜態檔（實測改過 app.js 之後，
+     它整段時間都拿舊版），版號一變才會真的重抓 -->
+<script src="static/sdk.js?v=__NANA_ASSET_V__"
+        onerror="window.__nlog('sdk-load-fail','static/sdk.js 載不到',true)"></script>
+<script src="static/app.js?v=__NANA_ASSET_V__"
+        onerror="window.__nlog('app-load-fail','static/app.js 載不到',true)"></script>
+</body>
+</html>

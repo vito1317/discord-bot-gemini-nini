@@ -115,6 +115,23 @@ class ReminderStore:
                     last_proactive TEXT,
                     last_seen      TEXT
                 )""")
+            # 主動關心送出去之後，要記得「那句話是為了哪件事講的」。
+            #
+            # 為什麼一定要存：AUTO_CHECKIN_PROMPT 刻意要求她不要一字不差複述
+            # 對方的原話，所以她會講成「之前聽你提到那些說法…」。對方隔了 44 分鐘
+            # 回一句「哪些說法」的時候：對話 session 早就過期了、拿「哪些說法」
+            # 這四個字去撈長期記憶也撈不到任何東西（那是純代名詞）——
+            # 結果她只能看著自己那句含糊的話說「抱歉我沒對上訊號」。實際發生過。
+            #
+            # 存下 message_id → 當初的 trigger，之後只要對方回覆那則訊息，
+            # 就能把原文接回去（見 main.build_reply_context）。
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS proactive_sent (
+                    message_id INTEGER PRIMARY KEY,
+                    user_id    INTEGER NOT NULL,
+                    trigger    TEXT,
+                    created_at TEXT
+                )""")
             # 活躍時段直方圖：他平常幾點在線。主動關心要挑他會看到的時間，
             # 寫死「白天才發」對凌晨活動的人沒用。
             self.conn.execute("""
@@ -321,6 +338,27 @@ class ReminderStore:
                 " ON CONFLICT(user_id) DO UPDATE SET last_proactive=excluded.last_proactive",
                 (user_id, datetime.now().strftime(FMT)))
 
+    def remember_proactive(self, message_id: int, user_id: int, trigger: str) -> None:
+        """記下「這則主動關心是為了哪件事發的」（見 proactive_sent 的說明）。"""
+        with self._lock, self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO proactive_sent"
+                " (message_id,user_id,trigger,created_at) VALUES (?,?,?,?)",
+                (message_id, user_id, (trigger or "")[:2000],
+                 datetime.now().strftime(FMT)))
+            # 只留最近 200 筆 —— 這是為了「對方回覆那則訊息」用的，不是歷史檔案
+            self.conn.execute(
+                "DELETE FROM proactive_sent WHERE message_id NOT IN"
+                " (SELECT message_id FROM proactive_sent"
+                "  ORDER BY created_at DESC LIMIT 200)")
+
+    def proactive_trigger(self, message_id: int) -> str:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT trigger FROM proactive_sent WHERE message_id=?",
+                (message_id,)).fetchone()
+        return (row["trigger"] or "") if row else ""
+
     def has_pending_auto_checkin(self, user_id: int) -> bool:
         with self._lock:
             n = self.conn.execute(
@@ -430,6 +468,14 @@ async def set_auto_checkin(user_id: int, enabled: bool) -> None:
 
 async def mark_proactive(user_id: int) -> None:
     await asyncio.to_thread(store().mark_proactive, user_id)
+
+
+async def remember_proactive(message_id: int, user_id: int, trigger: str) -> None:
+    await asyncio.to_thread(store().remember_proactive, message_id, user_id, trigger)
+
+
+async def proactive_trigger(message_id: int) -> str:
+    return await asyncio.to_thread(store().proactive_trigger, message_id)
 
 
 async def has_pending_auto_checkin(user_id: int) -> bool:

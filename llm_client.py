@@ -201,11 +201,16 @@ async def detect_emotion(text: str, extra_system: str = "") -> Optional[dict]:
 
 # ── 判斷要不要上網搜尋 ─────────────────────────────────
 
-async def decide_search(text: str) -> tuple[bool, str]:
-    """問模型這句話需不需要上網查。回傳 (need_search, query)。
+async def decide_search(text: str) -> tuple[bool, str, bool, str]:
+    """問模型這句話要不要上網，以及該用哪一種方式。
 
-    判斷失敗一律當作「不用搜」—— 奈奈的本業是陪聊，搜尋只是加分，
-    寧可不查也不要因為判斷器掛掉就卡住回覆。
+    回傳 (need_search, query, need_browser, browser_task)。
+
+    「要不要開瀏覽器」是搭這一次呼叫的便車判斷的 —— 這句話本來就要問模型
+    「需不需要上網」，順便問「是查資料還是要動手操作」不多花一次呼叫。
+
+    判斷失敗一律當作「都不用」—— 奈奈的本業是陪聊，上網只是加分，
+    寧可不做也不要因為判斷器掛掉就卡住回覆。
     """
     result = await chat_completion(
         [
@@ -220,7 +225,7 @@ async def decide_search(text: str) -> tuple[bool, str]:
         force_json=True,
     )
     if not result:
-        return False, ""
+        return False, "", False, ""
 
     try:
         cleaned = result.strip()
@@ -232,11 +237,18 @@ async def decide_search(text: str) -> tuple[bool, str]:
         data = json.loads(m.group() if m else cleaned)
     except (json.JSONDecodeError, AttributeError):
         logger.warning("無法解析搜尋判斷結果: %s", result[:200])
-        return False, ""
+        return False, "", False, ""
 
     need = bool(data.get("need_search", False))
     query = str(data.get("query", "") or "").strip()
-    return (need and bool(query)), query
+    want_browser = bool(data.get("need_browser", False))
+    browser_task = str(data.get("browser_task", "") or "").strip()
+
+    # 兩個都說要的話以「動手操作」為準 —— 使用者要的是把事情辦好，
+    # 不是拿一堆搜尋結果。prompt 已經交代不要同時 true，這裡再收一次。
+    if want_browser and browser_task:
+        return False, "", True, browser_task
+    return (need and bool(query)), query, False, ""
 
 
 # ── 挑一個表情回應 ─────────────────────────────────────
@@ -292,6 +304,109 @@ async def decide_reaction(
 
     out = [str(e).strip() for e in picks if str(e).strip()]
     return out[:config.REACTION_MAX_EMOJIS]
+
+
+# ── 瀏覽器：看畫面決定下一步 ───────────────────────────
+
+async def decide_browser_action(
+    *,
+    task: str,
+    url: str,
+    title: str,
+    page_text: str,
+    elements: list[dict],
+    history: list[str],
+    shot: bytes | None = None,
+) -> Optional[dict]:
+    """看現在的畫面決定下一步要做什麼。回傳一個 action dict，判斷失敗回 None。
+
+    截圖走 Gemma 4 的 vision（llama-server 有掛 mmproj）；同時也把可操作元素
+    列成文字送過去 —— 純看圖點座標很不準，帶編號清單讓它挑編號可靠得多。
+    """
+    lines = []
+    for e in elements:
+        bits = [f"[{e['i']}] <{e['tag']}"]
+        if e.get("type"):
+            bits.append(f" type={e['type']}")
+        bits.append(">")
+        if e.get("label"):
+            bits.append(f" {e['label']}")
+        if e.get("value"):
+            bits.append(f"（目前值：{e['value']}）")
+        if e.get("placeholder") and not e.get("label"):
+            bits.append(f"（提示：{e['placeholder']}）")
+        if e.get("options"):
+            bits.append(f"（選項：{'／'.join(e['options'][:12])}）")
+        if e.get("checked"):
+            bits.append("（已勾選）")
+        if not e.get("onScreen"):
+            bits.append("（要捲動才看得到）")
+        lines.append("".join(bits))
+
+    prompt = (
+        f"## 使用者交代的事\n{task}\n\n"
+        f"## 現在這一頁\n網址：{url}\n標題：{title}\n\n"
+        f"## 可以操作的東西\n" + ("\n".join(lines) or "（這頁沒有可操作的元素）") + "\n\n"
+        f"## 頁面文字\n{page_text or '（讀不到文字）'}\n\n"
+        f"## 你已經做過的步驟\n" + ("\n".join(history) or "（還沒開始）")
+    )
+
+    content: str | list[dict] = prompt
+    if shot:
+        import base64
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {
+                "url": "data:image/png;base64," + base64.b64encode(shot).decode()}},
+        ]
+
+    result = await chat_completion(
+        [
+            {"role": "system", "content": config.BROWSER_AGENT_PROMPT},
+            {"role": "user", "content": content},
+        ],
+        temperature=0.2,
+        max_tokens=400,
+        timeout=120.0,
+        base_url=config.GEMMA4_BASE_URL,
+        model=config.GEMMA4_MODEL,
+        force_json=True,
+    )
+    # 帶圖失敗（格式不合、圖太大）→ 退成純文字再試一次，別讓整個任務卡死
+    if not result and shot:
+        logger.warning("瀏覽器判斷帶圖失敗，改用純文字重試")
+        result = await chat_completion(
+            [
+                {"role": "system", "content": config.BROWSER_AGENT_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2, max_tokens=400, timeout=120.0,
+            base_url=config.GEMMA4_BASE_URL, model=config.GEMMA4_MODEL,
+            force_json=True,
+        )
+    if not result:
+        return None
+
+    try:
+        cleaned = result.strip()
+        if "```" in cleaned:
+            m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", cleaned, re.DOTALL)
+            if m:
+                cleaned = m.group(1).strip()
+        m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        data = json.loads(m.group() if m else cleaned)
+    except (json.JSONDecodeError, AttributeError):
+        logger.warning("無法解析瀏覽器動作：%s", result[:200])
+        return None
+
+    if not isinstance(data, dict) or not data.get("action"):
+        return None
+    if data.get("index") is not None:
+        try:
+            data["index"] = int(data["index"])
+        except (TypeError, ValueError):
+            data["index"] = None
+    return data
 
 
 # ── 抽取值得長期記住的事 ───────────────────────────────

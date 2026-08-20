@@ -38,6 +38,8 @@ from collections import deque
 import discord
 
 import config
+import reaction_memory
+import stats
 import llm_client
 
 logger = logging.getLogger("nana.react")
@@ -264,15 +266,26 @@ def _note_pressed(message: discord.Message, emojis: list[str]) -> None:
         _recent_emoji[message.author.id] = mem
     for e in emojis:
         mem.append(e)
+    # 也寫進持久記憶 —— 上面那份 deque 只在記憶體裡，重開就忘了，
+    # 於是她重啟後又貼一模一樣的表情
+    reaction_memory.note(message.author.id, emojis)
     _release_context(message)
     _prune()
 
 
 def _repeat_blocked(user_id: int) -> set[str]:
-    """這個人最近剛收過、這次不准再用的表情。"""
+    """這次不准用的表情：最近剛收過的，加上**他明確說過不要用的**。
+
+    「不要用」這件事一定要在程式層擋掉，不能只寫進 prompt。prompt 是提示，
+    模型偶爾不聽；而使用者已經開口拜託過一次了，再按一次就是言而無信。
+    """
     mem = list(_recent_emoji.get(user_id) or [])
     n = max(config.REACTION_AVOID_REPEAT_LAST, 0)
-    return set(mem[-n:]) if n else set()
+    raw = set(mem[-n:]) if n else set()
+    raw |= set(reaction_memory.avoided(user_id))
+    # 一律去掉 VS16（U+FE0F）再比。同一個表情有帶不帶 VS16 兩種寫法，
+    # 直接字串比對會當成不同的東西 —— 那樣「不要用 ❤️」就擋不掉她按的 ❤。
+    return {e.rstrip(_VS16) for e in raw if e}
 
 
 def _repeat_categories(user_id: int) -> set[str]:
@@ -308,6 +321,12 @@ def avoid_hint(user_id: int) -> str:
     硬擋（_repeat_blocked）只擋最近幾個，會擋掉的就整個丟掉；這條提示是讓模型
     一開始就別挑重複的，比事後丟掉好 —— 丟掉等於這次沒表情。
     """
+    # 持久記憶那份已經包含「最近按過什麼」＋「他說過不要用什麼」＋「他喜歡什麼」，
+    # 而且重開機還在（記憶體那份 deque 不會）。
+    persisted = reaction_memory.hint(user_id)
+    if persisted:
+        return persisted
+
     used = list(_recent_emoji.get(user_id) or [])
     if not used:
         return ""
@@ -468,6 +487,14 @@ async def follow(
         if target is None:
             return
 
+        # 他親口說過不要用的表情，**跟著別人按也不行**。
+        # 這條路本來完全沒經過硬擋（它不打模型、也不走 apply），所以只要有別人
+        # 按了那個表情，她就會跟著按下去 —— 正是使用者拜託她不要做的那件事。
+        if str(target).rstrip(_VS16) in reaction_memory.avoided(message.author.id):
+            logger.info("😊 不跟著按 %s —— 他說過不要用這個 │ user=%d",
+                        target, message.author.id)
+            return
+
         # 已經按過同一個就不用再按（Discord 會忽略，但省一次 API）
         key = str(emoji)
         for r in message.reactions:
@@ -487,6 +514,10 @@ async def follow(
             return
         try:
             await message.add_reaction(target)
+            stats.bump(stats.REACTIONS)
+            # 跟著按也算「她給過這個人這個表情」。不記的話「最近給過什麼」會漏掉
+            # 一半（實測 log 裡有不少是走這條路按上去的），下次就又挑到同一個。
+            reaction_memory.note(message.author.id, [str(target)])
         except discord.HTTPException as e:
             logger.debug("跟著按失敗（%s）：%s", target, e)
             _release_context(message)
@@ -558,15 +589,22 @@ async def apply(message: discord.Message, picks: list[str] | None) -> None:
         # 提示詞已經先叫模型換一個了，這裡是它沒聽話時的硬擋。
         blocked = _repeat_blocked(message.author.id)
         blocked_categories = _repeat_categories(message.author.id)
+        refused = set(reaction_memory.avoided(message.author.id))
         if blocked or blocked_categories:
             kept = [
                 t for t in targets
-                if str(t) not in blocked
+                if str(t).rstrip(_VS16) not in blocked
                 and _EMOJI_CATEGORY.get(str(t).rstrip(_VS16)) not in blocked_categories
             ]
-            if len(kept) != len(targets):
-                logger.debug("擋掉剛剛用過的同類表情：%s",
-                             [str(t) for t in targets if t not in kept])
+            dropped = [str(t) for t in targets if t not in kept]
+            if dropped:
+                # 他親口拒絕過的表情被擋下來 → 用 info。這件事值得看得到：
+                # 代表模型又想按那個表情，而硬擋確實有在工作。
+                banned = [d for d in dropped if d.rstrip(_VS16) in refused]
+                if banned:
+                    logger.info("😊 擋掉他說過不要用的表情：%s │ user=%d",
+                                " ".join(banned), message.author.id)
+                logger.debug("擋掉剛剛用過的同類表情：%s", dropped)
             targets = kept
 
         # 同一則訊息也不需要兩個同類表情（例如 😊😄）；不同語氣的組合如 🥺🫂
@@ -587,6 +625,7 @@ async def apply(message: discord.Message, picks: list[str] | None) -> None:
                     logger.debug("按表情失敗（%s）：%s", emoji, e)
                     continue
                 added.append(str(emoji))
+                stats.bump(stats.REACTIONS)
 
             if added:
                 _note_pressed(message, added)

@@ -42,6 +42,11 @@ class AgentResult:
     handled: bool = False
     reply: str = ""
     context: str = ""
+    # 瀏覽器任務：這裡只負責「接下任務」，真正開瀏覽器由 main.py 丟背景跑 ——
+    # 操作網站要好幾分鐘，不能卡在這條回話的路上。
+    browse_task: str = ""
+    browse_url: str = ""
+    browse_query: str = ""      # 沒給網址時，用這個關鍵字去搜（不是整句話）
 
 
 def _now_header() -> str:
@@ -49,14 +54,24 @@ def _now_header() -> str:
     return f"{now:%Y-%m-%d %H:%M}（星期{_WEEKDAY[now.weekday()]}）"
 
 
-def build_prompt() -> str:
+def build_prompt(last_browse: str = "") -> str:
     """每次呼叫都重建 —— 現在時間必須是即時的，不能在 import 時就固定。"""
-    return config.AGENT_PROMPT_TEMPLATE.format(now=_now_header())
+    block = ""
+    if last_browse:
+        block = (f"\n\n## 他最近請你做過的瀏覽任務\n{last_browse}\n"
+                 f"他如果說「換一間」「再試一次」「除了○○」「那家不行」這種**跟進的話**，"
+                 f"就是在講這個任務。這時候要回 browse，並把 text 寫成**改寫過的完整新任務**"
+                 f"（把他新的條件加進去、把不要的排除掉），不要只寫「換一間」。\n"
+                 f"但如果他只是**追問剛剛看到的內容**（「那個 XX 有什麼特點」"
+                 f"「第三段在說什麼」），而那些內容你已經看過了 → 回 none，"
+                 f"讓她直接用看到的內容回答，不用再開一次瀏覽器。\n"
+                 f"只有「要看的東西上次沒看到」（例如要點進某個分頁）才回 browse。")
+    return config.AGENT_PROMPT_TEMPLATE.format(now=_now_header()) + block
 
 
-async def _decide(text: str) -> dict | None:
+async def _decide(text: str, last_browse: str = "") -> dict | None:
     raw = await llm_client.chat_completion(
-        [{"role": "system", "content": build_prompt()},
+        [{"role": "system", "content": build_prompt(last_browse)},
          {"role": "user", "content": text}],
         temperature=0.1, max_tokens=400, timeout=60.0,
         base_url=config.GEMMA4_BASE_URL, model=config.GEMMA4_MODEL,
@@ -327,8 +342,39 @@ async def _tool_calc(d: dict, **_kw) -> AgentResult:
                        context=f"（算出來了：{expr} = {val}。這是精確值，直接告訴他）")
 
 
+async def _tool_browse(d: dict, **_kw) -> AgentResult:
+    """幫使用者上網操作（掛號、查詢、填表單）。
+
+    這裡不真的開瀏覽器 —— 只把任務接下來交給 main.py 背景執行，然後讓奈奈先回
+    一句話。操作一個網站動輒好幾分鐘，卡在這裡使用者會以為她掛了。
+    """
+    task = str(d.get("text") or "").strip()
+    if not task:
+        return AgentResult(handled=True,
+                           context="（他想請你上網幫他辦事，但沒講清楚要辦什麼。"
+                                   "問他要你去哪個網站、做什麼）")
+    if not config.BROWSER_ENABLED:
+        return AgentResult(handled=True,
+                           context="（瀏覽器操作功能目前關閉，跟他說你現在沒辦法幫他操作網站）")
+
+    url = str(d.get("url") or "").strip()
+    query = str(d.get("query") or "").strip()
+    logger.info("🖥️ 接下瀏覽任務：%s%s%s", task[:60],
+                f" │ {url}" if url else "", f" │ 搜「{query}」" if query else "")
+    return AgentResult(
+        handled=True,
+        browse_task=task,
+        browse_url=url,
+        browse_query=query,
+        context=(f"（你現在要開瀏覽器幫他做這件事：{task}。"
+                 f"先回一句簡短的「我去看看／我去幫你弄」讓他知道你開始了，"
+                 f"**不要說你已經做完**，也不要編造結果 —— 做完會另外傳截圖給他）"),
+    )
+
+
 TOOLS = {
     "remind_create": _tool_remind_create,
+    "browse": _tool_browse,
     "remind_list": _tool_remind_list,
     "remind_cancel": _tool_remind_cancel,
     "checkin_set": _tool_checkin_set,
@@ -344,6 +390,23 @@ TOOLS = {
 
 # ── 入口 ────────────────────────────────────────────────
 
+# 「拜託你幫我做一件事」的句型。關鍵字表列不完 —— 實測「幫虫合掛一個嘉義的診所」
+# 就因為只寫了「掛號」沒寫「掛」而整個被擋在門外，模型連判斷的機會都沒有。
+# 這兩個型態一中，就把話交給模型去判斷要用哪個工具（或不用）。
+_REQUEST_RES = (
+    # 幫我／幫他／替某人 + 動詞
+    re.compile(r"(幫|替|代)\S{0,8}?(掛|訂|約|報名|查|買|填|登記|預約|申請|辦)"),
+    # 動詞 + 目標（沒有「幫」字的祈使句：「掛一個嘉義的診所」）
+    re.compile(r"(掛|訂|約|買|報名|預約|申請)[^\n]{0,12}?"
+               r"(診所|醫院|門診|科|票|位子|座位|名額|課程|梯次|餐廳|飯店|旅館)"),
+)
+
+
+def _looks_like_request(text: str) -> bool:
+    """看起來是在拜託奈奈動手做一件事嗎（而不是單純聊天）。"""
+    return any(r.search(text) for r in _REQUEST_RES)
+
+
 _HINTS = (
     # 提醒
     "提醒", "叫我", "記得", "別忘", "不要忘", "鬧鐘", "行程",
@@ -357,6 +420,13 @@ _HINTS = (
     "天氣", "下雨", "氣溫", "溫度", "冷嗎", "熱嗎", "帶傘",
     # 計算（「算」單獨用會誤中「打算」「算了」「就算」，所以列具體講法）
     "算一下", "算算", "幫我算", "等於幾", "等於多少", "計算",
+    # 瀏覽器操作
+    "掛號", "預約", "訂位", "報名", "查詢", "幫我查", "幫我訂", "幫我約",
+    "幫我填", "幫我登記", "幫我看網站", "上網幫我", "官網", "網站",
+    "診所", "醫院", "門診", "看診", "訂票", "買票", "劃位",
+    # 問網頁「長什麼樣」的 —— 這種要真的開瀏覽器截圖才看得到，
+    # 只讀文字（讀連結）答不出設計和排版
+    "排版", "設計", "配色", "版面", "介面", "ui", "好不好看", "長什麼樣", "跑版",
     "乘以", "除以", "平方", "開根號",
 )
 
@@ -364,7 +434,8 @@ _HINTS = (
 async def handle(text: str, *, user_id: int, user_name: str, channel_id: int,
                  target_user_id: int | None = None,
                  target_user_name: str | None = None,
-                 is_admin: bool = False) -> AgentResult:
+                 is_admin: bool = False,
+                 last_browse: str = "") -> AgentResult:
     """判斷這句話要不要動用工具；要的話執行並回傳結果。
 
     先用關鍵字過濾，避免每一句閒聊都多花一次 LLM 呼叫 —— 奈奈的本業是陪聊，
@@ -374,10 +445,13 @@ async def handle(text: str, *, user_id: int, user_name: str, channel_id: int,
     """
     if not config.AGENT_ENABLED or not text:
         return AgentResult()
-    if not any(h in text for h in _HINTS):
+    # 剛剛才做過瀏覽任務 → 放寬門檻。「換一間好了」這種話沒有任何關鍵字，
+    # 但在那個情境下幾乎一定是要你接著做，不該被擋在門外變成純聊天。
+    if not (any(h in text for h in _HINTS) or _looks_like_request(text)
+            or last_browse):
         return AgentResult()
 
-    d = await _decide(text)
+    d = await _decide(text, last_browse)
     if not d:
         return AgentResult()
 

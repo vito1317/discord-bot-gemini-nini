@@ -210,6 +210,26 @@ class VoiceBridge:
             self.ai_audio_queue.append(raw[i:i + 3840])
         logger.info("🔊 語音念回：%r", text[:40])
 
+    def speak(self, text: str, *, interrupt: bool = False) -> bool:
+        """對外的 TTS 入口：把一段話念到語音頻道。回傳有沒有排進佇列。
+
+        interrupt=False 時**接在後面排隊**，不清佇列 —— 旁白是一句接一句講的，
+        用 _speak_text 那條會把前一句砍掉（它是為了「打斷 S2S 回應」設計的）。
+        """
+        if not (text or "").strip():
+            return False
+        pcm48 = _tts_to_pcm48(text)
+        if pcm48 is None or not len(pcm48):
+            return False
+        if interrupt:
+            self.ai_audio_queue.clear()
+        self._ai_last_audio_ts = time.time()
+        raw = pcm48.tobytes()
+        for i in range(0, len(raw), 3840):        # 20ms @ 48k stereo
+            self.ai_audio_queue.append(raw[i:i + 3840])
+        logger.info("🔊 旁白：%r", text[:50])
+        return True
+
     def _summarize_voice(self) -> None:
         """把剛剛語音對話的逐字稿總結後念回。"""
         kws = ("總結", "剛剛說", "剛才說", "整理一下", "摘要", "回顧一下")
@@ -725,6 +745,68 @@ class AIAudioSource(discord.AudioSource):
 
     def cleanup(self) -> None:
         pass
+
+
+_FRAME = 3840        # 20ms、48kHz、雙聲道、16-bit —— Discord 要的一幀
+
+
+class MixedAudioSource(discord.AudioSource):
+    """把奈奈的說話聲和瀏覽器的聲音疊在一起送進語音頻道。
+
+    為什麼要疊而不是二選一：py-cord 一次只能 play 一個 source。瀏覽器的聲音是
+    持續的，如果讓它獨占輸出，_ai_play_monitor 裡的 `not vc.is_playing()` 就永遠
+    不會成立 —— 她會變成完全說不出話。所以自己把兩邊的 PCM 加起來。
+
+    （Python 3.13 把 audioop 移除了，所以用 numpy 做加總與削峰。）
+    """
+
+    def __init__(self, browser_src, ai_src) -> None:
+        self.browser = browser_src
+        self.ai = ai_src
+        self._browser_dead = False
+
+    def _read(self, src) -> bytes:
+        try:
+            d = src.read()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("讀音訊失敗（當靜音）：%s", e)
+            return b""
+        return d if len(d) == _FRAME else b""
+
+    def read(self) -> bytes:
+        parts = []
+
+        if not self._browser_dead:
+            b = self._read(self.browser)
+            if b:
+                parts.append(np.frombuffer(b, dtype=np.int16).astype(np.int32)
+                             * config.BROWSER_AUDIO_GAIN)
+            else:
+                # ffmpeg 收掉了（瀏覽器聲音沒了）—— 剩下她的聲音繼續播，
+                # 不要把整個播放停掉，不然她也跟著閉嘴
+                self._browser_dead = True
+
+        a = self._read(self.ai)
+        if a:
+            parts.append(np.frombuffer(a, dtype=np.int16).astype(np.int32))
+
+        if not parts:
+            # 兩邊都沒東西：瀏覽器還活著就送靜音維持這條播放（等它出聲），
+            # 瀏覽器都沒了就結束，讓 speaking 燈熄掉
+            return b"\x00" * _FRAME if not self._browser_dead else b""
+
+        mixed = parts[0] if len(parts) == 1 else parts[0] + parts[1]
+        return np.clip(mixed, -32768, 32767).astype(np.int16).tobytes()
+
+    def is_opus(self) -> bool:
+        return False
+
+    def cleanup(self) -> None:
+        for s in (self.browser, self.ai):
+            try:
+                s.cleanup()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # ═══════════════════════════════════════════════════════

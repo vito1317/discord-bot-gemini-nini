@@ -18,25 +18,38 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import os
 import logging
 import re
 import threading
+import time
 from datetime import datetime, timedelta
 
 import discord
+import httpx
 from discord.ext import commands, tasks
 
+import activity
+import audio_sink
 import attachments
+import browser
 import config
 import llm_client
 import agent
 import memory
 import reactions
+import reaction_memory
 import reminders
+import focus_review
+import numpy as np
+
+import stats
 import webfetch
 import websearch
 from conversation import ConversationManager
-from voice_bridge import bridge, OmniSink, AIAudioSource, recording_done
+from voice_bridge import (bridge, OmniSink, AIAudioSource, MixedAudioSource,
+                          recording_done)
 from review import ReviewManager, detect_form, parse_form, ai_review, ai_followup_review, approve_member
 
 # ── 日誌設定 ───────────────────────────────────────────
@@ -63,14 +76,27 @@ intents.message_content = True
 intents.members = True
 intents.voice_states = True
 
+# auto_sync_commands=False：py-cord 的自動同步是 bulk 覆寫，會連 Discord 為
+# Activity 自動建立的 Entry Point 指令（type 4，語音頻道裡「啟動活動」那個）
+# 一起刪掉，Discord 就回 50240 並**整批拒絕** —— 結果所有指令都同步不了。
+# 改成自己同步，把 Entry Point 一起送回去（見 sync_commands_keep_entry_point）。
 bot = commands.Bot(
     command_prefix="!",
     intents=intents,
     help_command=None,
+    auto_sync_commands=False,
 )
 
 conv_manager = ConversationManager()
 review_manager = ReviewManager()
+
+# user_id → channel_id：瀏覽任務是在哪個頻道交代的。
+# 從 Activity 操作時（那裡沒有頻道概念）要把結果送回原本的對話裡。
+_last_channel_of: dict[int, int] = {}
+
+# 瀏覽器 session 的回收巡邏（on_ready 起，見 browser.reaper）
+_browser_reaper: asyncio.Task | None = None
+_persistent_views_registered = False
 
 
 # ═══════════════════════════════════════════════════════
@@ -82,6 +108,10 @@ review_manager = ReviewManager()
 async def on_ready():
     """機器人上線"""
     logger.info("🌸 %s 已上線！(%s)", config.BOT_NAME, bot.user)
+    global _persistent_views_registered
+    if not _persistent_views_registered:
+        bot.add_view(focus_review.FocusReviewView())
+        _persistent_views_registered = True
     logger.info("   已連接 %d 個伺服器", len(bot.guilds))
     logger.info("   觸發關鍵字: %s", ", ".join(config.TRIGGER_KEYWORDS))
     if config.ALERT_CHANNEL_ID:
@@ -89,11 +119,12 @@ async def on_ready():
     else:
         logger.warning("   ⚠️ 未設定 ALERT_CHANNEL_ID，危險訊息警告功能停用")
 
-    activity = discord.Activity(
+    # 變數名不能叫 activity —— 會遮蔽 activity 模組（Activity 操作台）
+    presence = discord.Activity(
         type=discord.ActivityType.listening,
         name="你的心聲 💛 | /help",
     )
-    await bot.change_presence(status=discord.Status.online, activity=activity)
+    await bot.change_presence(status=discord.Status.online, activity=presence)
 
     # 清理殘留的語音連線（避免重啟後 4017 錯誤）
     for vc in list(bot.voice_clients):
@@ -113,16 +144,140 @@ async def on_ready():
             except Exception as e:
                 logger.warning("斷開語音失敗: %s", e)
 
+    # 重啟前可能有殘留的瀏覽器（session 是記憶體內的，程序沒了就找不回來）
+    await browser.shutdown()
+    await audio_sink.stop()
+
+    # ── Discord Activity（語音頻道裡的操作台）──
+    # client_id 就是 application id，等連上線才拿得到，所以在這裡補
+    if not config.DISCORD_CLIENT_ID and bot.user:
+        config.DISCORD_CLIENT_ID = str(bot.user.id)
+    await sync_commands_keep_entry_point()
+
+    activity.register("resume", _activity_resume)
+    activity.register("start_task", _activity_start_task)
+    activity.register("sound", set_browser_sound)
+    activity.register("sound_state",
+                      lambda uid: bool((vc := _vc_for_user(uid)) and browser_sound_on(vc)))
+    if await activity.start():
+        logger.info("   🎛️ Activity 操作台：%s", config.ACTIVITY_PUBLIC_URL)
+
+    # 瀏覽器 session 的回收巡邏。任務做完之後畫面會留著，而「沒人在看就收」
+    # 這個判斷需要有人定期去檢查 —— 沒有這隻的話留著的 Chromium 會活到
+    # 下一次有人開瀏覽任務為止。
+    global _browser_reaper
+    if _browser_reaper is None or _browser_reaper.done():
+        _browser_reaper = asyncio.create_task(browser.reaper())
+
     if not cleanup_sessions.is_running():
         cleanup_sessions.start()
     if not deliver_reminders.is_running():
         deliver_reminders.start()
+    if config.PROFILE_STATS_ENABLED and not update_profile_stats.is_running():
+        update_profile_stats.start()
+
+
+async def _activity_resume(user_id: int, **kw) -> None:
+    """Activity 上按了確認／送了資料 → 接續那個任務。
+
+    結果照樣送回原本那個頻道 —— Activity 只是另一個操作介面，
+    紀錄和截圖還是要留在對話裡。
+    """
+    s = browser.pending_for(user_id)
+    task = s.task if s else ""
+    owner = s.user_id if s else user_id
+    delegate = s.delegate_id if s else None
+    cid = _last_channel_of.get(owner)
+    dest = bot.get_channel(cid) if cid else None
+    try:
+        result = await browser.resume(user_id, **kw)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Activity 接續任務失敗：%s", e)
+        return
+    if dest is not None:
+        await deliver_browse(dest, owner, result, task=task, delegate_id=delegate)
+        await send_browse_video(dest, owner, result)
+
+
+async def _activity_start_task(user_id: int, task: str) -> None:
+    """Activity 上直接交代一件新任務。
+
+    結果送到他最近一次用奈奈的頻道；找不到就私訊他。
+    """
+    dest = _last_channel_of.get(user_id)
+    dest = bot.get_channel(dest) if dest else None
+    if dest is None:
+        try:
+            u = bot.get_user(user_id) or await bot.fetch_user(user_id)
+            dest = u.dm_channel or await u.create_dm()
+        except discord.HTTPException:
+            logger.warning("Activity 交代的任務找不到可以回報的頻道")
+            return
+    await run_browse_task(dest, user_id, task)
+
+
+async def sync_commands_keep_entry_point() -> None:
+    """同步斜線指令，但保留 Activity 的 Entry Point 指令。
+
+    Discord 在啟用 Activities 時會自動建立一個 type=4（PRIMARY_ENTRY_POINT）的
+    指令。bulk 覆寫沒把它帶上就會被視為「要刪掉它」→ 400 error 50240，而且是
+    整批失敗，所有指令都不會更新。py-cord 不知道這種指令的存在，所以自己來。
+    """
+    app_id = bot.user.id
+    url = f"https://discord.com/api/v10/applications/{app_id}/commands"
+    headers = {"Authorization": f"Bot {config.DISCORD_TOKEN}",
+               "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            existing = (await c.get(url, headers=headers)).json()
+            keep = [cmd for cmd in existing
+                    if isinstance(cmd, dict) and cmd.get("type") == 4]
+
+            payload = [cmd.to_dict() for cmd in bot.pending_application_commands]
+            payload += keep
+
+            r = await c.put(url, headers=headers, json=payload)
+            if r.status_code == 200:
+                logger.info("   ⌨️ 已同步 %d 個指令（保留 %d 個 Entry Point）",
+                            len(payload) - len(keep), len(keep))
+            else:
+                logger.error("同步指令失敗：%s %s", r.status_code, r.text[:200])
+    except Exception as e:  # noqa: BLE001
+        logger.error("同步指令時出錯：%s", e)
+
+
+@bot.event
+async def on_application_command_error(
+    ctx: discord.ApplicationContext, error: discord.DiscordException):
+    """斜線指令出錯時給使用者一句話，並把原因記成一行 log。
+
+    預設行為是把整個 traceback 印到 stderr、使用者只看到「應用程式沒有回應」，
+    很難查。特別常見的是 10062 Unknown interaction —— 互動權杖只有 3 秒有效，
+    重啟期間按下的指令一定過期，那不是指令本身壞掉。
+    """
+    err = getattr(error, "original", error)
+
+    if isinstance(err, discord.NotFound) and getattr(err, "code", 0) == 10062:
+        logger.warning("⌛ /%s 的互動已過期（多半是在重啟期間按的）", ctx.command.qualified_name)
+        return
+
+    logger.error("❌ /%s 出錯：%s: %s", ctx.command.qualified_name,
+                 type(err).__name__, err)
+    try:
+        await ctx.respond(f"這個指令出錯了 😵‍💫（{type(err).__name__}）\n"
+                          f"-# 我已經記錄下來了，稍後再試一次看看。", ephemeral=True)
+    except discord.HTTPException:
+        pass
 
 
 @bot.event
 async def on_message(message: discord.Message):
     """處理所有收到的訊息"""
     if message.author == bot.user or message.author.bot:
+        return
+
+    # 重點關注必須早於指令與任何 AI 處理；名單成員的指令也要先經人工審核。
+    if await focus_review.intercept(message, bot):
         return
 
     # 先處理前綴指令
@@ -139,6 +294,16 @@ async def on_message(message: discord.Message):
         except Exception as e:  # noqa: BLE001
             logger.debug("記錄活躍時段失敗（忽略）：%s", e)
 
+    # 「以後不要用 😅 這個表情」這種話要真的被記下來。
+    #
+    # 放在這裡（每一則訊息都會經過）而不是放在表情判斷裡：抱怨通常是直接對她說的，
+    # 那條路走的是對話流程，不會經過表情判斷。之前就是這樣 —— 她當場答應「我會學著
+    # 調整」，但沒有任何地方記下來，下一則訊息又照樣按下去。
+    try:
+        reaction_memory.learn_from_text(message.author.id, message.content or "")
+    except Exception as e:  # noqa: BLE001
+        logger.debug("學表情偏好失敗（忽略）：%s", e)
+
     # ── 新成員審核：表單偵測或追蹤回覆 ──
     if await handle_review(message):
         return  # 已處理審核，不再做其他處理
@@ -150,6 +315,8 @@ async def on_message(message: discord.Message):
     is_reply_to_bot = bool(replied and replied.author == bot.user)
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_fixed_channel = config.FIXED_REPLY_CHANNEL_ID and message.channel.id == config.FIXED_REPLY_CHANNEL_ID
+    # 私人聊天室：裡面每一句她都會回，不用 @
+    is_private_room = message.channel.id in config.PRIVATE_ROOMS
 
     # 關鍵字偵測（文字訊息中包含「奈奈」等關鍵字）
     content_lower = message.content.lower()
@@ -159,10 +326,38 @@ async def on_message(message: discord.Message):
     # 一般頻道裡別人隨手貼的檔案奈奈不會去翻。
 
     talking_to_nana = bool(
-        is_fixed_channel or is_mentioned or is_reply_to_bot or is_dm or has_keyword
+        is_fixed_channel or is_private_room or is_mentioned or is_reply_to_bot
+        or is_dm or has_keyword
     )
 
     if talking_to_nana:
+        author_id = message.author.id
+
+        # ── 任務進行中被問「進度？」→ 直接回報，不要丟給聊天模型 ──
+        # 只有真的有任務在跑時才比對關鍵字，所以平常聊天不受影響，
+        # 也不必為了這件事多打一次模型。
+        if config.BROWSER_ENABLED:
+            snap = browser.progress_for(author_id)
+            if snap and any(k in content_lower for k in _PROGRESS_ASKS):
+                logger.info("🖥️ 回報進度 │ user=%d │ 第 %d 步", author_id, snap["step_no"])
+                await send_browse_progress(message, snap)
+                return
+
+        # ── 有瀏覽任務卡在「等你補資料」→ 這句話就是答案 ──
+        # 放在最前面：她剛剛才問「身分證幾號」，那這句就是要拿去填的，
+        # 不該再被當成一般閒聊丟給聊天模型。
+        if config.BROWSER_ENABLED and browser.awaiting_input(author_id):
+            answer = message.content
+            for mention in message.mentions:
+                answer = answer.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
+            answer = answer.strip()
+            if answer:
+                logger.info("🖥️ 收到補充資料，接續瀏覽任務 │ user=%d │ %d 字",
+                            author_id, len(answer))
+                await message.reply("收到，我接著弄 🖥️", mention_author=False)
+                asyncio.create_task(continue_browse_task(message, answer))
+                return
+
         # ── 表情回應（這條路不做情緒偵測，所以表情要自己判斷一次）──
         # 丟背景跑：按表情要等一次模型判斷，不能讓它拖到下面的回覆。
         asyncio.create_task(reactions.maybe_react(message, is_direct=True))
@@ -460,6 +655,30 @@ def _quote_text(msg: discord.Message) -> str:
     return "\n".join(parts).strip()
 
 
+def _recall_query(content: str, reply_block: str) -> str:
+    """撈長期記憶要用的查詢字串。
+
+    很短又全是代名詞的追問（「哪些說法」「什麼意思」「然後呢」）拿去比對記憶
+    什麼都撈不到 —— 那幾個字本身沒有內容。這種時候要用「他在回覆的那則訊息」
+    當查詢，指的東西才找得回來。
+    實例：她主動關心說「之前聽你提到那些說法」，對方回「哪些說法」，
+    用四個字去撈 → 空的 → 她只能說「抱歉我沒對上訊號」。
+    """
+    text = (content or "").strip()
+    if not reply_block:
+        return text
+    if len(text) <= config.RECALL_ANAPHORA_MAX_CHARS or _ANAPHORA.search(text):
+        # 把被回覆的內容接在後面（原文照樣保留 —— 他問的還是他問的）
+        return f"{text}\n{reply_block[:600]}"
+    return text
+
+
+# 純指代、自己沒有內容的追問
+_ANAPHORA = re.compile(
+    r"(哪些|哪個|哪一|什麼意思|什麼啊|是什麼|怎麼說|指的是|然後呢|所以呢"
+    r"|真的嗎|為什麼|怎樣|如何|誰啊|在說什麼|沒聽懂|聽不懂)")
+
+
 async def build_reply_context(
     replied: discord.Message | None,
 ) -> tuple[str, str, list[tuple[str, str]]]:
@@ -489,6 +708,26 @@ async def build_reply_context(
         f"（他接下來那句話是針對這則訊息講的，要接著這個脈絡回答，"
         f"不要問他在說什麼。）"
     )
+
+    # 他回覆的是「奈奈主動關心他」的那則訊息時，把當初的來源接回去。
+    #
+    # 這一段是必要的：主動關心刻意不複述對方的原話（見 AUTO_CHECKIN_PROMPT），
+    # 所以她講出來的是「之前聽你提到那些說法…」。對方回一句「哪些說法」的時候，
+    # 引用的全文就是她自己那句含糊的話，而「哪些說法」四個字拿去撈長期記憶
+    # 什麼都撈不到 —— 她只能回「抱歉我沒對上訊號」。實際發生過（2026-08-13）。
+    if is_self:
+        try:
+            trigger = await reminders.proactive_trigger(replied.id)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("查主動關心來源失敗（忽略）：%s", e)
+            trigger = ""
+        if trigger:
+            block += (
+                f"\n\n## 你當初為什麼主動找他\n"
+                f"你會講那句話，是因為他先前說過這件事：\n「{trigger[:1200]}」\n"
+                f"（所以他問「哪些」「什麼意思」的時候，指的就是這件事 ——"
+                f"直接順著它接下去講，不要說你不記得或沒對上訊號。）"
+            )
 
     # 被回覆的訊息裡的圖片也一起送給 vision —— 別人貼圖、他回覆那張圖問
     # 「這是什麼」的時候，看不到圖就答不出來。
@@ -584,6 +823,59 @@ async def schedule_auto_checkin(user_id: int, user_name: str, channel_id: int,
                 rid, user_name, due.strftime("%m-%d %H:%M"), intensity)
 
 
+_ECHO_HEAD_RE = re.compile(r"^\s*\[[^\]\n]{1,80}\]\s*說\s*[:：]\s*")
+_SEP_LINE_RE = re.compile(r"^\s*(?:-{3,}|—{2,}|\*{3,}|={3,}|─{3,})\s*$")
+
+
+def strip_echo(text: str, content: str) -> str:
+    """砍掉模型偶爾複製在回覆開頭的 `[暱稱] 說：原訊息`。
+
+    Gemma 有時會把 `[暱稱] 說：` 當成要照抄的文件標頭 —— 先把使用者那句話
+    重述一遍、加一條 `---`，才開始回答。實測同一句話三次有兩次會這樣。
+    system prompt 已經明確交代不要這麼做，這裡是它沒聽話時的保險。
+
+    抓不準邊界時一律原樣送出 —— 寧可讓他看到複述，也不要把真正的回覆剪掉。
+    """
+    if not text:
+        return text
+    m = _ECHO_HEAD_RE.match(text)
+    if not m:
+        return text          # 快路徑：正常回覆不會以這個開頭
+
+    rest = text[m.end():]
+
+    # 用原訊息的尾巴定位複述到哪裡結束。忽略空白比對 —— 模型常把換行併成空格，
+    # 而使用者的訊息本身可能有空行，單純切「第一個空行」會切不乾淨。
+    flat: list[str] = []
+    pos_map: list[int] = []
+    for i, ch in enumerate(rest):
+        if not ch.isspace():
+            flat.append(ch)
+            pos_map.append(i)
+    tail = re.sub(r"\s+", "", content or "")[-12:]
+
+    cut = -1
+    if tail:
+        found = "".join(flat).find(tail)
+        if found >= 0:
+            cut = pos_map[found + len(tail) - 1] + 1
+    if cut < 0:
+        blank = rest.find("\n\n")     # 定位不到 → 退回切第一個空行
+        cut = blank if blank >= 0 else -1
+    if cut < 0:
+        return text
+
+    lines = rest[cut:].lstrip().split("\n")
+    while lines and (not lines[0].strip() or _SEP_LINE_RE.match(lines[0])):
+        lines.pop(0)          # 複述後面常跟一條分隔線
+    body = "\n".join(lines).strip()
+
+    if not body:
+        return text           # 整則都只是複述 → 原樣送出，別送空訊息
+    logger.info("✂️ 砍掉回覆開頭的複述（%d → %d 字）", len(text), len(body))
+    return body
+
+
 async def recall_memory(user_id: int, content: str) -> str:
     """撈出跟這句話相關的長期記憶，組成要附在 system prompt 後面的區塊。"""
     if not config.MEMORY_ENABLED or not content:
@@ -630,9 +922,9 @@ async def learn_from(user_id: int, user_name: str, user_text: str, reply: str) -
         logger.warning("記憶抽取失敗：%s", e)
 
 
-async def _noop_str() -> str:
+async def _noop_pair() -> tuple[str, str]:
     """給 asyncio.gather 用的空佔位（已經讀了連結就不再搜尋）。"""
-    return ""
+    return "", ""
 
 
 async def maybe_fetch_urls(content: str, progress: "Progress | None" = None) -> tuple[str, list[str]]:
@@ -678,16 +970,19 @@ async def _run_search(query: str, progress: "Progress | None") -> str:
     return websearch.format_for_prompt(query, results)
 
 
-async def maybe_search(content: str, progress: "Progress | None" = None) -> str:
-    """判斷這句話要不要上網查；要的話回傳塞進 prompt 的結果區塊，否則回空字串。
+async def maybe_search(content: str, progress: "Progress | None" = None) -> tuple[str, str]:
+    """判斷這句話要不要上網。回傳 (搜尋結果區塊, 要交給瀏覽器做的事)。
 
     兩段式，為了不讓「陪聊」這條主線白白多花一次 LLM 呼叫：
       1. 明確講「查一下 / 搜尋 / google」→ 直接搜，關鍵字就是去掉觸發詞的剩餘部分
-      2. 看起來像在問資訊（有問號、什麼、最新…）→ 才問模型要不要搜
+      2. 看起來像在問資訊（有問號、什麼、最新…）→ 才問模型要不要上網
       3. 其餘（訴苦、打招呼、閒聊）→ 完全不碰網路
+
+    第 2 步那次呼叫**同時**判斷「這是查資料還是要動手操作網站」——
+    搭同一次便車，不為了「要不要開瀏覽器」另外打一次模型。
     """
     if not config.WEB_SEARCH_ENABLED or not content:
-        return ""
+        return "", ""
 
     lowered = content.lower()
 
@@ -699,20 +994,26 @@ async def maybe_search(content: str, progress: "Progress | None" = None) -> str:
                 query = re.sub(re.escape(extra), " ", query, flags=re.IGNORECASE)
             query = re.sub(r"\s+", " ", query).strip(" ，。,.?？!！")
             if not query:
-                return ""
+                return "", ""
             logger.info("🔎 明確要求搜尋 │ %s", query[:60])
-            return await _run_search(query, progress)
+            return await _run_search(query, progress), ""
 
-    # ② 像在問資訊 → 交給模型判斷
+    # ② 像在問資訊 → 交給模型判斷（順便判斷要不要開瀏覽器）
     if not any(h in lowered for h in config.QUESTION_HINTS):
-        return ""
+        return "", ""
 
-    need, query = await llm_client.decide_search(content)
+    need, query, want_browser, browse_task = await llm_client.decide_search(content)
+
+    if want_browser and config.BROWSER_ENABLED:
+        logger.info("🖥️ 模型判定要動手操作網站 │ %s%s", browse_task[:60],
+                    f" │ 搜「{query}」" if query else "")
+        # 用 \x00 把「任務」和「搜尋關鍵字」串在一起帶回去（呼叫端會拆開）
+        return "", f"{browse_task}\x00{query}"
     if not need:
-        return ""
+        return "", ""
 
     logger.info("🔎 模型判定需要搜尋 │ %s", query[:60])
-    return await _run_search(query, progress)
+    return await _run_search(query, progress), ""
 
 
 async def handle_direct_conversation(
@@ -726,7 +1027,13 @@ async def handle_direct_conversation(
     """
     content = message.content
     for mention in message.mentions:
-        content = content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
+        if mention == bot.user:
+            # 奈奈自己的 @提及直接移除（使用者 @奈奈 只是為了觸發對話）
+            content = content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
+        else:
+            # 其他人的 @提及換成暱稱，讓 LLM 知道在講誰
+            name = mention.display_name
+            content = content.replace(f"<@{mention.id}>", name).replace(f"<@!{mention.id}>", name)
     content = content.strip()
 
     if replied is None and message.reference is not None:
@@ -776,17 +1083,65 @@ async def handle_direct_conversation(
         (m for m in message.mentions if m != bot.user and not getattr(m, "bot", False)),
         None,
     )
+    # ── 這件事是幫誰辦的 ──
+    # 兩種講法都認：「幫 @虫合 掛號」（@提及）、或是回覆虫合的訊息說「幫他掛號」。
+    # 要資料／要確認時會 tag 這個人，他回的話也能接回任務（見 browser.Session）。
+    delegate = target_user
+    if delegate is None and replied is not None:
+        author = replied.author
+        if author != bot.user and not getattr(author, "bot", False) \
+                and author.id != message.author.id:
+            delegate = author
+
     is_admin = bool(message.guild and message.author.guild_permissions.manage_guild)
     agent_text = content
     if target_user:   # 把 @提及換成名字，免得 <@id> 干擾 LLM 解析
         for tag in (f"<@{target_user.id}>", f"<@!{target_user.id}>"):
             agent_text = agent_text.replace(tag, target_user.display_name)
+    # 最近做過的瀏覽任務：「換一間」「再試一次」這種跟進的話本身沒有資訊，
+    # 要把上一個任務給模型看它才知道在講什麼（也才會重新開一個任務而不是純聊天）。
+    last_browse = ""
+    if config.BROWSER_ENABLED:
+        recent = browser.recent_task(user_id)
+        if recent:
+            last_browse = (f"{recent['task']}（結果：{recent['status']}"
+                           f"{'／' + recent['summary'][:80] if recent['summary'] else ''}）")
+
     agent_result = await agent.handle(
         agent_text, user_id=user_id, user_name=user_name, channel_id=channel_id,
         target_user_id=(target_user.id if target_user else None),
         target_user_name=(target_user.display_name if target_user else None),
-        is_admin=is_admin,
+        is_admin=is_admin, last_browse=last_browse,
     )
+    # agent 接下了瀏覽任務 → 背景開瀏覽器，這條路先讓奈奈回一句「我去看看」。
+    # 權限不足時不啟動，但仍讓她用自己的話講（context 已經交代她要說什麼）。
+    browse_started = False
+    if agent_result.browse_task:
+        allowed = True
+        if config.BROWSER_ADMIN_ONLY:
+            perms = getattr(message.author, "guild_permissions", None)
+            allowed = bool(perms and perms.manage_guild)
+        if allowed:
+            browse_started = True
+            # 模型有時會漏掉 url 欄位 —— 使用者訊息裡有網址就直接用，
+            # 不然會退回「先去搜」，變成把他貼的網址拿去搜尋
+            browse_url = agent_result.browse_url
+            if not browse_url:
+                found = webfetch.find_urls(content)
+                if found:
+                    browse_url = found[0]
+                    logger.info("🖥️ 模型沒給網址，改用訊息裡的：%s", browse_url)
+            asyncio.create_task(run_browse_task(
+                message.channel, user_id,
+                agent_result.browse_task, browse_url,
+                delegate_id=(delegate.id if delegate else None),
+                delegate_name=(delegate.display_name if delegate else ""),
+                search_hint=agent_result.browse_query))
+        else:
+            agent_result = agent.AgentResult(
+                handled=True,
+                context="（瀏覽器操作只開放給管理員，跟他說你這件事沒辦法幫他做）")
+
     if agent_result.reply:
         await progress.clear()
         session.add_message("user", f"[{user_name}] 說：{content}")
@@ -798,10 +1153,36 @@ async def handle_direct_conversation(
     # 有貼連結就以連結為準，不再另外搜尋 —— 對方已經指定要看哪一頁了。
     async with message.channel.typing():
         fetch_block, fetch_images = await maybe_fetch_urls(content, progress)
-        memory_context, search_block = await asyncio.gather(
-            recall_memory(user_id, content),
-            maybe_search(content, progress) if not fetch_block else _noop_str(),
+        memory_context, (search_block, auto_browse) = await asyncio.gather(
+            recall_memory(user_id, _recall_query(content, reply_block)),
+            maybe_search(content, progress)
+            if not fetch_block and not browse_started else _noop_pair(),
         )
+
+    # ── 模型判定這件事要「動手操作網站」才辦得到 → 開瀏覽器 ──
+    # agent 那條路已經接下任務時就不重複開（browse_started）。
+    if auto_browse and not browse_started and config.BROWSER_ENABLED:
+        allowed = True
+        if config.BROWSER_ADMIN_ONLY:
+            perms = getattr(message.author, "guild_permissions", None)
+            allowed = bool(perms and perms.manage_guild)
+        if allowed:
+            auto_task, _, auto_query = auto_browse.partition("\x00")
+            asyncio.create_task(run_browse_task(
+                message.channel, user_id, auto_task,
+                delegate_id=(delegate.id if delegate else None),
+                delegate_name=(delegate.display_name if delegate else ""),
+                search_hint=auto_query))
+            extra_browse_note = (
+                f"\n\n## 你正在幫他做的事\n你判斷這件事要真的上網站操作才辦得到，"
+                f"已經開瀏覽器去做了：{auto_browse}\n"
+                f"先回一句簡短的「我去幫你看看」讓他知道，**不要說你已經做完**，"
+                f"也不要編造結果 —— 做完會另外傳截圖給他。")
+        else:
+            extra_browse_note = ("\n\n## 說明\n他這件事需要你上網站操作，"
+                                 "但這個功能只開放給管理員，跟他說你沒辦法幫他做。")
+    else:
+        extra_browse_note = ""
 
     # 網頁裡的圖片（PDF 掃描頁、圖片連結）併進附件的圖片清單一起送
     for uri in fetch_images:
@@ -836,6 +1217,23 @@ async def handle_direct_conversation(
     # agent 已經把事情做完了，把結果交給奈奈用自己的語氣講出來
     if agent_result.context:
         extra_prompt += f"\n\n## 你剛剛幫他做的事\n{agent_result.context}"
+    # 自動判定要開瀏覽器時，讓她知道自己已經去做了（別讓她編造結果）
+    extra_prompt += extra_browse_note
+
+    # 剛剛才上網看過的內容 —— 帶著它，追問才答得出來。
+    # 少了這段的話：她捲完整個網站、截圖也傳了，使用者追問「那個演算法有什麼特點」
+    # 她卻回「我還沒看到你的演算法內容」。
+    if config.BROWSER_ENABLED:
+        seen = browser.recent_task(user_id)
+        if seen and seen.get("text"):
+            extra_prompt += (
+                f"\n\n## 你剛剛上網看到的內容\n"
+                f"（你去做的事：{seen['task']}）\n"
+                f"（網址：{seen.get('url', '')}）\n"
+                f"{seen['text'][:2500]}\n\n"
+                f"他如果追問這一頁上的東西（上面某個項目、某段內容的細節），"
+                f"**就用上面這些內容回答，不要說你沒看到** —— 你剛剛才看完。\n"
+                f"上面真的找不到答案時，才說要再去那一頁看一次。")
 
     async with message.channel.typing():
         if progress.msg is not None:
@@ -858,6 +1256,9 @@ async def handle_direct_conversation(
             )
 
     await progress.clear()
+
+    # 模型有時會先把他那句話抄一遍才開始回答，砍掉再送出
+    response = strip_echo(response, content)
 
     if response:
         session.add_message("assistant", response)
@@ -966,6 +1367,8 @@ async def handle_emotion_detection(message: discord.Message):
             user_message=f"[{user_name}] 說：{content}\n\n{emotion_context}",
         )
 
+    response = strip_echo(response, content)
+
     if response:
         if intensity >= 4:
             await send_long_message(message.channel, response, reference=message)
@@ -994,6 +1397,7 @@ async def send_danger_alert(
     if not alert_channel:
         logger.error("❌ 找不到警告頻道 ID: %d", config.ALERT_CHANNEL_ID)
         return
+    stats.bump(stats.ALERTS)
 
     embed = discord.Embed(
         title="🚨 危險訊息警告",
@@ -1252,6 +1656,839 @@ async def slash_checkin_status(
     await ctx.respond(embed=embed, ephemeral=True)
 
 
+# ═══════════════════════════════════════════════════════
+# 私人聊天室
+# ═══════════════════════════════════════════════════════
+
+room_group = bot.create_group("room", "和奈奈的私人聊天室 🌸")
+
+
+def _register_room(channel_id: int) -> None:
+    if channel_id not in config.PRIVATE_ROOMS:
+        config.PRIVATE_ROOMS.append(channel_id)
+        config.save_settings()
+
+
+def _unregister_room(channel_id: int) -> None:
+    if channel_id in config.PRIVATE_ROOMS:
+        config.PRIVATE_ROOMS.remove(channel_id)
+        config.save_settings()
+
+
+def _my_open_rooms(user_id: int) -> list[int]:
+    """這個人名下還活著的房間 id。順手把已經被刪掉的從名單清掉。
+
+    靠討論串名字結尾的 `-{user_id}` 認人 —— 重啟後記憶體是空的，
+    但名字還在，這樣才認得出哪一間是誰的。
+    """
+    alive: list[int] = []
+    for cid in list(config.PRIVATE_ROOMS):
+        ch = bot.get_channel(cid)
+        if ch is None:
+            _unregister_room(cid)          # 頻道已刪 → 名單也清掉
+            continue
+        if isinstance(ch, discord.Thread) and ch.archived:
+            continue
+        if f"-{user_id}" in (getattr(ch, "name", "") or ""):
+            alive.append(cid)
+    return alive
+
+
+@room_group.command(name="open", description="開一間只有你和奈奈的私人聊天室 🌸")
+@discord.option("topic", type=str, description="想聊什麼（選填，會寫在開場）", required=False)
+async def room_open(ctx: discord.ApplicationContext, topic: str = ""):
+    """在目前頻道底下開一個私密討論串，裡面奈奈會回應每一句話。"""
+    if ctx.guild is None:
+        await ctx.respond(
+            f"你現在就是在私訊我了，這裡本來就只有我們兩個 🌸\n直接說吧，我在聽。",
+            ephemeral=True)
+        return
+
+    parent = ctx.channel
+    # 討論串裡不能再開討論串
+    if isinstance(parent, discord.Thread):
+        parent = parent.parent
+    if not isinstance(parent, discord.TextChannel):
+        await ctx.respond("這個頻道沒辦法開討論串，換一個文字頻道試試 🌸", ephemeral=True)
+        return
+
+    mine = _my_open_rooms(ctx.author.id)
+    if len(mine) >= config.PRIVATE_ROOM_MAX_PER_USER:
+        existing = bot.get_channel(mine[0])
+        await ctx.respond(
+            f"你已經有一間了：{existing.mention}\n聊完想關掉的話在裡面用 `/room close` 🌸",
+            ephemeral=True)
+        return
+
+    await ctx.defer(ephemeral=True)
+
+    # 名字裡帶 id，重啟後才認得出哪一間是誰的
+    name = f"🌸 奈奈與{ctx.author.display_name}-{ctx.author.id}"[:100]
+    try:
+        thread = await parent.create_thread(
+            name=name,
+            type=discord.ChannelType.private_thread,
+            auto_archive_duration=config.PRIVATE_ROOM_ARCHIVE_MINUTES,
+            invitable=False,
+        )
+    except discord.Forbidden:
+        await ctx.respond(
+            "我沒有在這個頻道開私密討論串的權限 😢\n"
+            "請管理員給我「建立私人討論串」和「在討論串中發送訊息」兩個權限，"
+            "或是直接**私訊我**也一樣可以聊。", ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        logger.warning("開私人聊天室失敗：%s", e)
+        await ctx.respond(f"開不起來 😵‍💫（{str(e)[:100]}）\n直接私訊我也可以喔。",
+                          ephemeral=True)
+        return
+
+    _register_room(thread.id)
+    logger.info("🌸 開了私人聊天室 #%d │ %s（%d）", thread.id,
+                ctx.author.display_name, ctx.author.id)
+
+    try:
+        await thread.add_user(ctx.author)
+    except discord.HTTPException:
+        pass
+
+    embed = discord.Embed(
+        title="🌸 這裡只有我們兩個",
+        description=(
+            f"{ctx.author.mention} 這是你的私人聊天室。\n"
+            f"**在這裡你不用 @我**，講什麼我都會回你。"
+        ),
+        color=0xFFB7C5,
+    )
+    embed.add_field(
+        name="可以做的事",
+        value=("• 直接說話就好，想聊什麼都可以\n"
+               "• 傳檔案、圖片、貼網址給我看\n"
+               "• 「30分鐘後提醒我吃藥」這類也照樣有用\n"
+               "• 要我幫你上網辦事（掛號、查詢）也可以，"
+               "**身分證這類資料在這裡給比較安全**"),
+        inline=False,
+    )
+    embed.add_field(
+        name="聊完了",
+        value="用 `/room close` 關掉，或就放著 —— "
+              f"{config.PRIVATE_ROOM_ARCHIVE_MINUTES // 60} 小時沒講話會自動封存。",
+        inline=False,
+    )
+    embed.set_footer(text=f"— {config.BOT_NAME}")
+
+    opener = f"{ctx.author.mention}"
+    await thread.send(content=opener, embed=embed)
+
+    if topic:
+        # 有講主題就讓她直接接話，不要讓人再打一次
+        session = conv_manager.get_session(ctx.author.id, thread.id)
+        session.add_message("user", f"[{ctx.author.display_name}] 說：{topic}")
+        async with thread.typing():
+            reply = await llm_client.generate_support_response(
+                user_message=f"[{ctx.author.display_name}] 說：{topic}",
+                memory_context=await recall_memory(ctx.author.id, topic),
+            )
+        reply = strip_echo(reply, topic)
+        if reply:
+            session.add_message("assistant", reply)
+            await send_long_message(thread, reply)
+
+    await ctx.respond(f"開好了 → {thread.mention} 🌸", ephemeral=True)
+
+
+@room_group.command(name="close", description="關掉這間私人聊天室 👋")
+@discord.option("delete", type=bool, required=False,
+                description="連整個房間一起刪掉（預設只封存，紀錄還留著）")
+async def room_close(ctx: discord.ApplicationContext, delete: bool = False):
+    ch = ctx.channel
+    if not isinstance(ch, discord.Thread) or ch.id not in config.PRIVATE_ROOMS:
+        await ctx.respond("這裡不是私人聊天室喔。要在房間裡面用這個指令 🌸", ephemeral=True)
+        return
+
+    _unregister_room(ch.id)
+    conv_manager.clear_session(ctx.author.id, ch.id)
+    logger.info("🌸 關閉私人聊天室 #%d │ %s │ delete=%s",
+                ch.id, ctx.author.display_name, delete)
+
+    if delete:
+        await ctx.respond("好，那我把這間整個收掉 👋 想聊隨時再開一間 💛")
+        try:
+            await ch.delete()
+            return
+        except discord.HTTPException as e:
+            logger.warning("刪除討論串失敗：%s", e)
+            await ctx.followup.send(
+                "我刪不掉這個討論串（少了「管理討論串」權限）😢\n"
+                "不過我已經不會在這裡回話了，你可以手動刪除它。", ephemeral=True)
+            return
+
+    await ctx.respond("好，那我把這裡收起來 👋 想聊隨時再開一間就好 💛")
+
+    # 一定要 lock：只封存的話任何人再講一句話就會自動解除封存，
+    # 但那時我已經不在這裡回話了 —— 會變成一間沒人應答的空房間。
+    try:
+        await ch.edit(archived=True, locked=True)
+    except discord.HTTPException as e:
+        # 之前這裡是 logger.debug，失敗完全看不出來，使用者只會覺得「指令沒用」
+        logger.warning("封存討論串失敗：%s", e)
+        try:
+            await ctx.followup.send(
+                f"我沒辦法把這個討論串封存起來（{str(e)[:80]}）—— "
+                f"少了「管理討論串」權限。\n"
+                f"**但我已經不會在這裡回話了**，你可以自己把它封存或刪掉，"
+                f"或用 `/room close delete:true` 讓我直接刪。",
+                ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+
+# ═══════════════════════════════════════════════════════
+# 瀏覽器操作
+# ═══════════════════════════════════════════════════════
+
+
+_URL_IN_TEXT = re.compile(r"(https?://\S+)")
+
+
+def _safe_links(text: str) -> str:
+    """把網址用 <> 包起來。
+
+    Discord 的自動連結會把網址後面緊接的中文一起吃進去（「開了 https://…?q=在嘉義找診所
+    （這件事是幫…）」整段變成一個藍色連結）。<> 同時也不會產生預覽卡片。
+    """
+    return _URL_IN_TEXT.sub(lambda m: f"<{m.group(1)}>", text or "")
+
+
+def _browse_embed(result: browser.Result, task: str) -> discord.Embed:
+    """把瀏覽結果做成 embed。截圖另外用 discord.File 附上。"""
+    look = {
+        "done": ("✅ 幫你弄好了", 0x4CAF50),
+        "need_confirm": ("✋ 送出前先問你一下", 0xFFA500),
+        "need_input": ("❓ 我需要一點資料", 0xFFA500),
+        "blocked": ("🚧 這裡我沒辦法幫你", 0xFF6B6B),
+        "max_steps": ("⏳ 還沒做完就先停下來了", 0xFFA500),
+        "error": ("😵‍💫 中途出錯了", 0xFF6B6B),
+    }
+    title, color = look.get(result.status, ("🖥️ 瀏覽結果", 0xFFB7C5))
+
+    desc = result.question or result.summary or "（沒有補充說明）"
+    if result.status == "need_input":
+        desc += ("\n\n-# 🔒 不想讓別人看到的話按下面的「私密輸入」，"
+                 "打的內容不會出現在頻道裡；直接在頻道打也可以。")
+    embed = discord.Embed(title=title, description=desc[:3800], color=color)
+    embed.add_field(name="你交代的事", value=task[:1000] or "—", inline=False)
+
+    if result.steps:
+        lines = [f"{s.n}. {_safe_links(s.detail)}" for s in result.steps[-6:]]
+        embed.add_field(name=f"我做了什麼（共 {len(result.steps)} 步）",
+                        value="\n".join(lines)[:1000], inline=False)
+    if result.url:
+        embed.add_field(name="現在停在", value=f"<{result.url[:900]}>", inline=False)
+    if result.linger:
+        # 做完不等於畫面沒了 —— 不講的話沒人知道還可以接著自己用
+        embed.add_field(
+            name="🖥️ 畫面我先留著",
+            value=("到語音頻道的「活動」→ 奈奈的操作台，可以繼續看這一頁，"
+                   "也可以自己點、自己打字（她已經停手了，不會跟你搶）。\n"
+                   f"-# 沒人在看就會自動收掉，最多留 "
+                   f"{config.BROWSER_LINGER_MAX_S // 60} 分鐘。"),
+            inline=False)
+    if result.shot:
+        embed.set_image(url="attachment://nana-browse.png")
+        embed.set_footer(text=f"— {config.BOT_NAME}｜畫面截圖如上")
+    else:
+        # 不要在沒有圖的時候還寫「畫面截圖如上」—— 會讓人以為圖掉了
+        embed.set_footer(text=f"— {config.BOT_NAME}｜這次沒能拍到畫面")
+    return embed
+
+
+class ConfirmBrowse(discord.ui.View):
+    """送出前的確認按鈕。
+
+    交代任務的人、以及「這件事是幫誰辦的」那個人，兩邊都按得動 ——
+    幫別人掛號時，讓當事人自己點頭比較合理。其他人一律按不動。
+    """
+
+    def __init__(self, user_id: int, task: str, delegate_id: int | None = None):
+        super().__init__(timeout=config.BROWSER_SESSION_IDLE_S)
+        self.user_id = user_id
+        self.task = task
+        self.delegate_id = delegate_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        allowed = {self.user_id} | ({self.delegate_id} if self.delegate_id else set())
+        if interaction.user and interaction.user.id in allowed:
+            return True
+        await interaction.response.send_message(
+            "這是別人的事情，只有當事人能決定要不要送出喔 🌸", ephemeral=True)
+        return False
+
+    async def _finish(self, interaction: discord.Interaction, *,
+                      confirmed: bool, always: bool = False):
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.response.edit_message(view=self)
+        except discord.HTTPException:
+            pass
+        self.stop()
+        if always:
+            try:
+                await interaction.channel.send(
+                    f"<@{self.user_id}> 好，這個任務接下來我就不再一個一個問了 🏃\n"
+                    f"-# 但**需要你給資料的時候還是會停下來問你**（身分證、生日這類我不會自己填）。")
+            except discord.HTTPException:
+                pass
+        result = await browser.resume(self.user_id, confirmed=confirmed, always=always)
+        await deliver_browse(interaction.channel, self.user_id, result, task=self.task,
+                             delegate_id=self.delegate_id)
+
+    @discord.ui.button(label="確認送出", style=discord.ButtonStyle.danger, emoji="✅")
+    async def yes(self, _button: discord.ui.Button, interaction: discord.Interaction):
+        await self._finish(interaction, confirmed=True)
+
+    @discord.ui.button(label="一律允許", style=discord.ButtonStyle.primary, emoji="🏃")
+    async def always(self, _button: discord.ui.Button, interaction: discord.Interaction):
+        """這個任務剩下的送出都不再問。
+
+        只放行「要不要按下去」；缺資料一樣會停下來問本人，
+        個資不能自己編、內網不能去這些紅線也都還在。
+        """
+        await self._finish(interaction, confirmed=True, always=True)
+
+    @discord.ui.button(label="不要送出", style=discord.ButtonStyle.secondary, emoji="✋")
+    async def no(self, _button: discord.ui.Button, interaction: discord.Interaction):
+        await self._finish(interaction, confirmed=False)
+
+
+class BrowseInputModal(discord.ui.Modal):
+    """私密輸入視窗：打進去的字只有他自己看得到，不會出現在頻道裡。
+
+    身分證、生日、驗證碼這種東西不該叫人在公開頻道打出來 ——
+    modal 送出後直接進瀏覽器，訊息紀錄裡什麼都不留。
+    """
+
+    def __init__(self, owner_id: int, delegate_id: int | None,
+                 task: str, question: str):
+        super().__init__(title="🔒 私密輸入（只有你看得到）")
+        self.owner_id = owner_id
+        self.delegate_id = delegate_id
+        self.task = task
+        self.add_item(discord.ui.InputText(
+            label=(question[:44] or "請輸入奈奈需要的資料"),
+            placeholder="打在這裡，別人看不到",
+            style=discord.InputTextStyle.short,
+            max_length=200,
+            required=True,
+        ))
+
+    async def callback(self, interaction: discord.Interaction):
+        value = (self.children[0].value or "").strip()
+        if not value:
+            await interaction.response.send_message("沒收到內容，再試一次好嗎？",
+                                                    ephemeral=True)
+            return
+        logger.info("🔒 收到私密輸入 │ user=%d │ %d 字", interaction.user.id, len(value))
+        await interaction.response.send_message(
+            "收到了，我繼續弄 🔒（你剛剛打的東西沒有出現在頻道裡）", ephemeral=True)
+
+        try:
+            result = await browser.resume(interaction.user.id, confirmed=True,
+                                          extra=value)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("私密輸入接續失敗：%s", e)
+            result = browser.Result(status="error",
+                                    summary=f"中途出錯了：{str(e)[:150]}")
+        await deliver_browse(interaction.channel, self.owner_id, result,
+                             task=self.task, delegate_id=self.delegate_id)
+
+
+class PrivateInput(discord.ui.View):
+    """「🔒 私密輸入」按鈕。只有當事人（或交代的人）按得動。"""
+
+    def __init__(self, owner_id: int, task: str, question: str,
+                 delegate_id: int | None = None):
+        super().__init__(timeout=config.BROWSER_SESSION_IDLE_S)
+        self.owner_id = owner_id
+        self.delegate_id = delegate_id
+        self.task = task
+        self.question = question
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        allowed = {self.owner_id} | ({self.delegate_id} if self.delegate_id else set())
+        if interaction.user and interaction.user.id in allowed:
+            return True
+        await interaction.response.send_message(
+            "這是別人的事情，只有當事人能填喔 🌸", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="私密輸入", style=discord.ButtonStyle.primary, emoji="🔒")
+    async def private(self, _button: discord.ui.Button,
+                      interaction: discord.Interaction):
+        await interaction.response.send_modal(
+            BrowseInputModal(self.owner_id, self.delegate_id,
+                             self.task, self.question))
+
+
+async def deliver_browse(dest, user_id: int, result: browser.Result, *, task: str,
+                         delegate_id: int | None = None):
+    """把結果（含截圖）送到頻道。停在確認點時附上確認按鈕。
+
+    delegate_id：這件事是幫誰辦的。需要資料或要確認送出時，**tag 的是他**
+    —— 別人的身分證只有本人給得出來，也只有本人該點頭。
+    """
+    if dest is None:
+        return
+    embed = _browse_embed(result, task)
+
+    # 畫面上已經有個資（身分證／生日填進去了）→ 公開頻道就不貼那張圖
+    private_here = isinstance(dest, discord.DMChannel) or (
+        getattr(dest, "id", 0) in config.PRIVATE_ROOMS)
+    shot = result.shot
+    if shot and result.sensitive and not private_here:
+        shot = None
+        embed.set_image(url=None)
+        embed.add_field(
+            name="🔒 截圖沒有貼出來",
+            value=("畫面上有你的個人資料，這裡是公開頻道所以我不貼。\n"
+                   "想看畫面的話用 `/room open` 開個私人聊天室，或直接私訊我 🌸"),
+            inline=False)
+
+    files = []
+    if shot:
+        files.append(discord.File(io.BytesIO(shot), filename="nana-browse.png"))
+
+    view = None
+    if result.status == "need_confirm":
+        view = ConfirmBrowse(user_id, task, delegate_id=delegate_id)
+    elif result.status == "need_input":
+        # 給一個私密輸入的入口 —— 身分證這種不該叫人在頻道裡打出來
+        view = PrivateInput(user_id, task, result.question, delegate_id=delegate_id)
+
+    # 要資料／要確認 → 找當事人；純粹報告結果 → 回報給交代的人
+    needs_person = result.status in ("need_input", "need_confirm")
+    if needs_person and delegate_id:
+        who = f"<@{delegate_id}>"
+        note = f"\n-# 這是 <@{user_id}> 請我幫你處理的，需要你本人回覆才能繼續 🌸"
+    else:
+        who = f"<@{user_id}>"
+        note = ""
+
+    try:
+        await dest.send(content=who + note, embed=embed, files=files, view=view)
+    except discord.HTTPException as e:
+        logger.warning("送出瀏覽結果失敗：%s", e)
+        try:
+            await dest.send(f"{who} {result.summary or result.question}"[:1900])
+        except discord.HTTPException:
+            pass
+
+
+class BrowseProgress(discord.ui.View):
+    """任務進度：**整個過程只用一則訊息**，用 ◀ ▶ 翻頁看每一步。
+
+    以前是每一步發一則帶截圖的訊息 —— 看得到過程，但十幾步就把頻道洗掉了。
+    現在所有步驟收在同一則裡：跑的時候自動停在最新一步，想回頭看就按方向鍵，
+    紀錄全部留著（任務結束後按鈕還能繼續翻）。
+    """
+
+    def __init__(self, dest, user_id: int, task: str) -> None:
+        super().__init__(timeout=None)      # 任務結束後還要能翻，不設逾時
+        self.dest = dest
+        self.user_id = user_id
+        self.task = task
+        self.msg: discord.Message | None = None
+        self.pages: list[tuple[browser.Step, bytes | None]] = []
+        self.cursor = -1          # -1 = 跟著最新一步跑
+        self.done = False
+        self._last_live = 0.0     # 即時畫面的節流時間戳
+
+    # ── 內部：組出目前那一頁 ──
+
+    def _at(self) -> int:
+        return len(self.pages) - 1 if self.cursor < 0 else min(
+            self.cursor, len(self.pages) - 1)
+
+    def _render(self) -> tuple[str, discord.File | None]:
+        if not self.pages:
+            return (f"<@{self.user_id}> 🖥️ 開始了…\n"
+                    f"-# 「{self.task[:110]}」｜想知道進度隨時問我「進度？」"), None
+
+        i = self._at()
+        step, shot = self.pages[i]
+        head = "✅ **做完了**" if self.done else "🖥️ **進行中**"
+        pos = f"第 {step.n} 步" + (f"（共 {len(self.pages)} 步，看第 {i + 1} 頁）"
+                                   if len(self.pages) > 1 else "")
+        follow = "" if self.cursor < 0 else "　·　⏭ 回到最新"
+        body = (f"<@{self.user_id}> {head}　{pos}{follow}\n"
+                f"{_safe_links(step.detail[:250])}\n"
+                f"-# 「{self.task[:110]}」")
+        f = (discord.File(io.BytesIO(shot), filename=f"step-{step.n}.png")
+             if shot else None)
+        return body, f
+
+    def _sync_buttons(self) -> None:
+        i = self._at()
+        many = len(self.pages) > 1
+        self.prev.disabled = not many or i <= 0
+        self.next.disabled = not many or i >= len(self.pages) - 1
+        self.latest.disabled = self.cursor < 0
+
+    async def _paint(self, interaction: discord.Interaction | None = None) -> None:
+        content, f = self._render()
+        self._sync_buttons()
+
+        # 附件的用法很容易寫錯（我第一版就錯了，訊息永遠停在「開始了…」）：
+        #   • attachments= 只吃 discord.Attachment（會呼叫 a.to_dict()），
+        #     塞 discord.File 進去會噴 AttributeError —— 而且不是 HTTPException，
+        #     很容易被漏接、然後靜靜地什麼都不做
+        #   • 要換成新圖：file=<File> 再配 attachments=[] 清掉舊的
+        #     （只給 file 的話 py-cord 會「保留舊附件再加一張」，會越疊越多）
+        kw: dict = {"content": content, "view": self, "attachments": []}
+        if f is not None:
+            kw["file"] = f
+
+        try:
+            if interaction is not None:
+                await interaction.response.edit_message(**kw)
+            elif self.msg is not None:
+                await self.msg.edit(**kw)
+        except Exception as e:  # noqa: BLE001
+            # 這裡刻意用 warning 不用 debug —— 上一版壓成 debug，
+            # 結果進度不動卻完全查不到原因
+            logger.warning("更新進度訊息失敗：%s: %s", type(e).__name__, e)
+
+    # ── 對外 ──
+
+    async def start(self) -> None:
+        content, _ = self._render()
+        self._sync_buttons()
+        try:
+            self.msg = await self.dest.send(content=content, view=self)
+        except discord.HTTPException:
+            self.msg = None
+
+    async def update(self, step: browser.Step, shot: bytes | None = None) -> None:
+        """做完一步就更新那一則訊息（不發新訊息，所以不會洗頻）。"""
+        self.pages.append((step, shot))
+        if len(self.pages) > config.BROWSER_MAX_KEPT_SHOTS:
+            self.pages.pop(0)      # 太舊的丟掉，避免無限長
+        if self.cursor >= 0:
+            return                 # 使用者正在回頭翻，不要把畫面搶走
+        await self._paint()
+
+    async def live(self, shot: bytes) -> None:
+        """等模型想下一步的空檔送來的即時畫面 —— 就地換圖，不發新訊息。
+
+        使用者正在回頭翻頁時不要動（cursor >= 0），否則畫面會被搶走。
+        也做節流：Discord 的訊息編輯是 5 次/5 秒。
+        """
+        if self.cursor >= 0 or not self.pages or self.msg is None:
+            return
+        now = time.time()
+        if now - self._last_live < max(config.BROWSER_LIVE_INTERVAL, 2.0):
+            return
+        self._last_live = now
+        step, _old = self.pages[-1]
+        self.pages[-1] = (step, shot)      # 把最後一頁的畫面換成最新的
+        await self._paint()
+
+    async def finish(self) -> None:
+        """任務結束 —— 訊息留著當紀錄，按鈕還能翻。"""
+        self.done = True
+        if self.pages:
+            await self._paint()
+        elif self.msg is not None:
+            try:
+                await self.msg.delete()   # 一步都沒跑就沒有紀錄價值
+            except discord.HTTPException:
+                pass
+
+    # ── 按鈕 ──
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user and interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message(
+            "這是別人的任務紀錄喔 🌸", ephemeral=True)
+        return False
+
+    @discord.ui.button(emoji="◀", style=discord.ButtonStyle.secondary)
+    async def prev(self, _b: discord.ui.Button, interaction: discord.Interaction):
+        self.cursor = max(0, self._at() - 1)
+        await self._paint(interaction)
+
+    @discord.ui.button(emoji="▶", style=discord.ButtonStyle.secondary)
+    async def next(self, _b: discord.ui.Button, interaction: discord.Interaction):
+        self.cursor = min(len(self.pages) - 1, self._at() + 1)
+        await self._paint(interaction)
+
+    @discord.ui.button(emoji="⏭", label="最新", style=discord.ButtonStyle.primary)
+    async def latest(self, _b: discord.ui.Button, interaction: discord.Interaction):
+        self.cursor = -1
+        await self._paint(interaction)
+
+
+def _voice_for(dest) -> "discord.VoiceClient | None":
+    """這個頻道所在的伺服器裡，奈奈有沒有在語音頻道。"""
+    guild = getattr(dest, "guild", None)
+    if guild is None:
+        return None
+    vc = guild.voice_client
+    return vc if vc and vc.is_connected() else None
+
+
+async def narrate_step(dest, step: browser.Step) -> None:
+    """在語音頻道用聲音講一句她正在做什麼。
+
+    只有奈奈已經在語音頻道（有人 /join 過）才會念，而且句子要短 ——
+    TTS 一句 2~4 秒，太長會排隊排到下一步都做完了。
+    """
+    if not config.BROWSER_NARRATE:
+        return
+    if _voice_for(dest) is None:
+        return
+    line = re.sub(r"https?://\S+", "網址", step.detail)      # 別把網址念出來
+    line = re.sub(r"（[^）]*）", "", line).strip()             # 去掉括號註記
+    line = line[:60]
+    if not line:
+        return
+    try:
+        await asyncio.to_thread(bridge.speak, f"第{step.n}步，{line}")
+    except Exception as e:  # noqa: BLE001
+        logger.debug("旁白失敗（忽略）：%s", e)
+
+
+async def run_browse_task(dest, user_id: int, task: str, url: str = "",
+                          delegate_id: int | None = None,
+                          delegate_name: str = "", search_hint: str = ""):
+    """背景執行一次瀏覽任務，做完把結果和截圖送到頻道。
+
+    delegate_id：這件事是幫誰辦的（「幫 @虫合 掛號」時就是虫合）。
+    需要資料或要確認送出時會 tag 他，他回的話也能接回這個任務。
+    """
+    if getattr(dest, "id", None):
+        _last_channel_of[user_id] = dest.id
+    logger.info("🖥️ 開始瀏覽任務 │ user=%d │ %s%s%s", user_id, task[:60],
+                f" │ {url}" if url else "",
+                f" │ 幫 {delegate_name}({delegate_id}) 辦" if delegate_id else "")
+    stats.bump(stats.BROWSE)
+    prog = BrowseProgress(dest, user_id, task)
+    await prog.start()
+    # on_closed 有可能在任務結束「之後」才被呼叫（畫面留著的情況），
+    # 那時候 result 這個區域變數已經不在它的閉包範圍裡了，所以用一個小盒子帶過去
+    result_holder: dict = {}
+    try:
+        private_here = isinstance(dest, discord.DMChannel) or (
+            getattr(dest, "id", 0) in config.PRIVATE_ROOMS)
+        async def on_step(step, shot=None):
+            await prog.update(step, shot)
+            await narrate_step(dest, step)
+
+        # 做完之後畫面會留著（見 browser._finish），所以錄影不是在任務結束時
+        # 拿得到 —— Playwright 要等 context 關掉才把 webm 寫完。真的收掉的時候
+        # 再把影片補送過來。
+        async def on_closed(_uid: int, video: str | None):
+            # 瀏覽器沒了就不該再往語音頻道送它的聲音
+            try:
+                await set_browser_sound(user_id, False)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("關瀏覽器聲音失敗（忽略）：%s", e)
+            if not video:
+                return
+            await send_browse_video(
+                dest, user_id,
+                browser.Result(status="done", video=video,
+                               sensitive=result_holder.get("sensitive", False)))
+
+        result = await browser.start(user_id, task, start_url=url or None,
+                                     delegate_id=delegate_id,
+                                     delegate_name=delegate_name,
+                                     private_channel=private_here,
+                                     search_hint=search_hint,
+                                     on_step=on_step,
+                                     on_frame=prog.live,
+                                     on_closed=on_closed)
+        # 影片是任務結束後才收掉的，那時候要知道畫面上有沒有個資才決定能不能傳
+        result_holder["sensitive"] = result.sensitive
+    except Exception as e:  # noqa: BLE001
+        logger.warning("瀏覽任務失敗：%s", e)
+        result = browser.Result(status="error", summary=f"中途出錯了：{str(e)[:150]}")
+    await prog.finish()
+    # 把「她停下來要問什麼」一起記下來 —— 只記 need_input 這個狀態的話，
+    # 事後根本查不出她為什麼會在「看yt」這種任務上要人給資料。
+    logger.info("🖥️ 瀏覽任務結束 │ user=%d │ %s%s%s%s", user_id, result.status,
+                f" │ 停在 {result.url[:80]}" if result.url else "",
+                f" │ 問：{result.question[:120]}" if result.question else "",
+                f" │ 錄影 {result.video}" if result.video else "")
+    await deliver_browse(dest, user_id, result, task=task, delegate_id=delegate_id)
+    await send_browse_video(dest, user_id, result)
+
+    # 把「她剛剛去看了什麼、看到什麼」寫進對話歷史 ——
+    # 沒有這個的話使用者追問「那個 XX 有什麼特點」時她會說「我還沒看到」，
+    # 明明十二步前才剛捲完整頁。
+    try:
+        u = bot.get_user(user_id)
+        name = u.display_name if u else "他"
+        session = conv_manager.get_session(user_id, getattr(dest, "id", 0))
+        session.add_message("user", f"[{name}] 說：（請你上網幫我：{task}）")
+        session.add_message("assistant", result.summary or result.question
+                            or "（我去看過了，把畫面傳給你了）")
+    except Exception as e:  # noqa: BLE001
+        logger.debug("寫入瀏覽對話歷史失敗（忽略）：%s", e)
+
+    asyncio.create_task(learn_from_browse(user_id, task, result))
+
+
+async def send_browse_video(dest, user_id: int, result: browser.Result) -> None:
+    """把操作錄影傳上去（太大就只說有錄但傳不了）。
+
+    Discord 不讓機器人開螢幕分享，所以「事後可以倒回去看」的錄影是最接近的東西。
+    畫面上有個資又在公開頻道時不傳 —— 影片裡什麼都看得到。
+    """
+    path = result.video
+    if not path:
+        return
+    try:
+        if result.sensitive and not (
+                isinstance(dest, discord.DMChannel)
+                or getattr(dest, "id", 0) in config.PRIVATE_ROOMS):
+            logger.info("🎥 錄影含個資且在公開頻道，不傳")
+            return
+        size_mb = os.path.getsize(path) / 1024 / 1024
+        if size_mb > config.BROWSER_MAX_VIDEO_MB:
+            await dest.send(f"-# 🎥 這次的操作錄影 {size_mb:.1f} MB，超過上限傳不上來。")
+            return
+        await dest.send(
+            content=f"-# 🎥 剛剛的操作錄影（{size_mb:.1f} MB）—— 可以倒回去看每一步",
+            file=discord.File(path, filename="nana-browse.webm"))
+    except discord.HTTPException as e:
+        logger.warning("傳錄影失敗：%s", e)
+    except OSError as e:
+        logger.warning("讀錄影檔失敗：%s", e)
+    finally:
+        browser.cleanup_video(path)
+
+
+async def learn_from_browse(user_id: int, task: str, result: browser.Result) -> None:
+    """把「奈奈幫他上網做了什麼」記進長期記憶。
+
+    只記真的做完的（done）—— 半途卡住的紀錄下來只會變雜訊。
+    **個資一定先遮掉**：使用者交代的話裡很常直接帶著身分證和生日
+    （「幫我掛號，身分證 A1234…」），那種東西不該寫進資料庫。
+    """
+    if not (config.MEMORY_ENABLED and result.status == "done"):
+        return
+    user = bot.get_user(user_id)
+    name = user.display_name if user else str(user_id)
+    desc = (f"（他請你用瀏覽器幫他辦事：{browser.redact(task)}）"
+            f"結果：{browser.redact(result.summary)}")
+    # 沿用一般聊天那條記憶抽取的路（含去重、個人/共享分流）
+    await learn_from(user_id, name, desc, result.summary)
+
+
+# 任務進行中被問「進度？」時的關鍵字。只有真的有任務在跑才會比對，
+# 所以不會影響平常聊天（也不必為此多打一次模型）。
+_PROGRESS_ASKS = (
+    "進度", "怎樣了", "怎麼樣了", "好了嗎", "弄好了嗎", "做完了嗎", "完成了嗎",
+    "到哪了", "弄到哪", "還要多久", "還沒好", "在做什麼", "在幹嘛", "現在如何",
+    "status", "progress",
+)
+
+
+async def send_browse_progress(message: discord.Message, snap: dict) -> None:
+    """把目前進度和最後看到的畫面回給使用者。"""
+    step_no, mx = snap["step_no"], snap["max_steps"]
+    elapsed = snap["elapsed"]
+    waiting = snap.get("awaiting")
+
+    if waiting == "confirm":
+        head = "我停在**等你確認送出**那一步了，上面那則訊息按一下就會繼續 🌸"
+    elif waiting == "input":
+        head = "我在**等你給我資料**，你直接打給我就好 🌸"
+    else:
+        head = f"還在弄，已經做了 **{step_no}** 步（上限 {mx}），花了 {elapsed} 秒。"
+
+    embed = discord.Embed(title="🖥️ 目前進度", description=head, color=0xFFB7C5)
+    embed.add_field(name="你交代的事", value=snap["task"][:1000] or "—", inline=False)
+    if snap["steps"]:
+        lines = [f"{s.n}. {_safe_links(s.detail)}" for s in snap["steps"][-6:]]
+        embed.add_field(name="做過的步驟", value="\n".join(lines)[:1000], inline=False)
+    if snap["url"]:
+        embed.add_field(name="現在這一頁",
+                        value=f"{snap['title'][:80]}\n<{snap['url'][:400]}>", inline=False)
+
+    files = []
+    if snap["shot"]:
+        files.append(discord.File(io.BytesIO(snap["shot"]), filename="nana-progress.png"))
+        embed.set_image(url="attachment://nana-progress.png")
+        embed.set_footer(text=f"— {config.BOT_NAME}｜這是我最後看到的畫面")
+    else:
+        embed.set_footer(text=f"— {config.BOT_NAME}")
+
+    try:
+        await message.reply(embed=embed, files=files, mention_author=False)
+    except discord.HTTPException as e:
+        logger.warning("回報進度失敗：%s", e)
+
+
+async def continue_browse_task(message: discord.Message, answer: str):
+    """有人補了資料 → 接續那個停住的瀏覽任務。
+
+    回話的可能是交代的人，也可能是「被代辦的當事人」（他來給自己的身分證），
+    所以 session 是用參與者找的，結果也要回報給原本交代的人。
+    """
+    s = browser.awaiting_input(message.author.id)
+    task = s.task if s else ""
+    owner_id = s.user_id if s else message.author.id
+    delegate_id = s.delegate_id if s else None
+    try:
+        result = await browser.resume(message.author.id, confirmed=True, extra=answer)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("接續瀏覽任務失敗：%s", e)
+        result = browser.Result(status="error", summary=f"中途出錯了：{str(e)[:150]}")
+    await deliver_browse(message.channel, owner_id, result, task=task,
+                         delegate_id=delegate_id)
+
+
+@bot.slash_command(name="browse", description="請奈奈用瀏覽器幫你操作或查詢（例如掛號）🖥️")
+@discord.option("task", type=str, description="你要她做什麼，例如「掛台大心臟科下週三下午」")
+@discord.option("url", type=str, description="知道網址就給她（選填）", required=False)
+@discord.option("for_user", type=discord.Member, required=False,
+                description="這是幫誰辦的？需要資料時會直接問他（選填）")
+async def slash_browse(
+    ctx: discord.ApplicationContext,
+    task: str,
+    url: str = "",
+    for_user: discord.Member = None,
+):
+    if not config.BROWSER_ENABLED:
+        await ctx.respond("瀏覽器操作功能目前是關閉的，請管理員用 `/settings browser` 打開 🌸",
+                          ephemeral=True)
+        return
+    if not browser.AVAILABLE:
+        await ctx.respond("這台機器還沒裝好 Playwright，我沒辦法開瀏覽器 😵‍💫", ephemeral=True)
+        return
+
+    perms = getattr(ctx.author, "guild_permissions", None)
+    if config.BROWSER_ADMIN_ONLY and not (perms and perms.manage_guild):
+        await ctx.respond("這個功能目前只開放給管理員使用喔 🌸", ephemeral=True)
+        return
+
+    who = f"幫 {for_user.display_name} " if for_user else "幫你"
+    await ctx.respond(
+        f"好，我去{who}看看 🖥️\n-# 「{task[:120]}」— 操作網站要一點時間，"
+        f"做完（或需要問資料）我會把畫面截圖傳上來。"
+        + (f"\n-# 需要 {for_user.mention} 的資料時我會直接問他。" if for_user else "")
+    )
+    # 不要 await 在 interaction 上 —— 瀏覽動輒好幾分鐘，早就逾時了
+    asyncio.create_task(run_browse_task(
+        ctx.channel, ctx.author.id, task, url,
+        delegate_id=(for_user.id if for_user else None),
+        delegate_name=(for_user.display_name if for_user else "")))
+
+
 @bot.slash_command(name="todos", description="查看你的待辦清單 📝")
 async def slash_todos(ctx: discord.ApplicationContext):
     if not config.AGENT_ENABLED:
@@ -1360,6 +2597,91 @@ async def slash_support(ctx: discord.ApplicationContext):
     await ctx.respond(embed=embed)
 
 
+# ── 重點關注用戶與審核控制台 ───────────────────────────
+
+
+focus_group = bot.create_group("focus", "重點關注用戶訊息審核 🔎")
+
+
+@focus_group.command(name="channel", description="設定重點關注訊息的審核頻道")
+@discord.default_permissions(administrator=True)
+@discord.option("channel", type=discord.TextChannel, description="管理員接收審核卡片的頻道")
+async def focus_channel(ctx: discord.ApplicationContext, channel: discord.TextChannel):
+    config.FOCUS_REVIEW_CHANNEL_ID = channel.id
+    config.save_settings()
+    await ctx.respond(f"✅ 重點關注審核頻道已設為 {channel.mention}。", ephemeral=True)
+
+
+@focus_group.command(name="add", description="加入重點關注用戶")
+@discord.default_permissions(administrator=True)
+@discord.option("member", type=discord.Member, description="所有發言都必須經過審核的成員")
+async def focus_add(ctx: discord.ApplicationContext, member: discord.Member):
+    if not config.FOCUS_REVIEW_CHANNEL_ID:
+        await ctx.respond("請先用 `/focus channel` 設定審核頻道，再加入重點關注用戶。",
+                          ephemeral=True)
+        return
+    if member.bot:
+        await ctx.respond("不能把機器人加入重點關注名單。", ephemeral=True)
+        return
+    if member.id not in config.FOCUS_WATCHED_USERS:
+        config.FOCUS_WATCHED_USERS.append(member.id)
+        config.save_settings()
+    await ctx.respond(
+        f"🔎 已將 {member.mention} 加入重點關注名單；之後的發言都會先進入審核。",
+        ephemeral=True,
+    )
+
+
+@focus_group.command(name="remove", description="移除重點關注用戶")
+@discord.default_permissions(administrator=True)
+@discord.option("member", type=discord.Member, description="要解除重點關注的成員")
+async def focus_remove(ctx: discord.ApplicationContext, member: discord.Member):
+    if member.id in config.FOCUS_WATCHED_USERS:
+        config.FOCUS_WATCHED_USERS.remove(member.id)
+        config.save_settings()
+        text = f"✅ 已將 {member.mention} 移出重點關注名單。"
+    else:
+        text = f"{member.mention} 不在重點關注名單中。"
+    await ctx.respond(text, ephemeral=True)
+
+
+@focus_group.command(name="mode", description="切換 AI 或人工訊息審核")
+@discord.default_permissions(administrator=True)
+@discord.option("mode", type=str, description="選擇審核方式", choices=["人工審核", "AI 審核"])
+async def focus_mode(ctx: discord.ApplicationContext, mode: str):
+    config.FOCUS_REVIEW_MODE = "ai" if mode == "AI 審核" else "manual"
+    config.save_settings()
+    note = "（含附件的訊息仍會轉人工審核）" if config.FOCUS_REVIEW_MODE == "ai" else ""
+    await ctx.respond(f"✅ 已切換為 **{mode}** {note}", ephemeral=True)
+
+
+@focus_group.command(name="list", description="查看重點關注用戶名單")
+@discord.default_permissions(administrator=True)
+async def focus_list(ctx: discord.ApplicationContext):
+    users = config.FOCUS_WATCHED_USERS
+    text = "\n".join(f"• <@{uid}> (`{uid}`)" for uid in users) or "目前沒有重點關注用戶。"
+    await ctx.respond(embed=discord.Embed(title="🔎 重點關注名單", description=text,
+                                          color=0x5865F2), ephemeral=True)
+
+
+@focus_group.command(name="pending", description="查看待人工審核訊息")
+@discord.default_permissions(administrator=True)
+async def focus_pending(ctx: discord.ApplicationContext):
+    items = focus_review.pending_summary()
+    text = "\n".join(
+        f"• `#{item.id}` <@{item.author_id}> → <#{item.channel_id}>" for item in items
+    ) or "目前沒有待審訊息。"
+    await ctx.respond(embed=discord.Embed(title="📨 待審佇列", description=text,
+                                          color=0xF0A500), ephemeral=True)
+
+
+@focus_group.command(name="panel", description="開啟重點關注管理控制台")
+@discord.default_permissions(administrator=True)
+async def focus_panel(ctx: discord.ApplicationContext):
+    await ctx.respond(embed=focus_review.control_embed(),
+                      view=focus_review.FocusControlView(), ephemeral=True)
+
+
 # ── 設定指令 ───────────────────────────────────────────
 
 
@@ -1440,6 +2762,18 @@ async def settings_view(ctx: discord.ApplicationContext):
             f"• 審核頻道: {review_ch_text}\n"
             f"• 移除角色: {remove_role.mention if remove_role else '❌ 未設定'}\n"
             f"• 加上角色: {add_role.mention if add_role else '❌ 未設定'}"
+        ),
+        inline=False,
+    )
+
+    focus_ch = bot.get_channel(config.FOCUS_REVIEW_CHANNEL_ID) if config.FOCUS_REVIEW_CHANNEL_ID else None
+    embed.add_field(
+        name="🔎 重點關注審核",
+        value=(
+            f"• 審核頻道: {focus_ch.mention if focus_ch else '❌ 未設定'}\n"
+            f"• 審核模式: {'🤖 AI' if config.FOCUS_REVIEW_MODE == 'ai' else '👤 人工'}\n"
+            f"• 關注人數: {len(config.FOCUS_WATCHED_USERS)}\n"
+            f"• 待審訊息: {focus_review.pending_count()}"
         ),
         inline=False,
     )
@@ -1700,6 +3034,53 @@ async def settings_reactions(
     )
 
 
+@settings_group.command(name="browser", description="開關瀏覽器操作功能 🖥️")
+@discord.default_permissions(administrator=True)
+@discord.option("enable", type=bool, description="True (可以幫人操作網站) 或 False (完全關閉)")
+@discord.option("admin_only", type=bool,
+                description="只有管理員能用（選填，預設維持現狀）", required=False)
+async def settings_browser(
+    ctx: discord.ApplicationContext,
+    enable: bool,
+    admin_only: bool = None,
+):
+    """開關瀏覽器操作（僅管理員）"""
+    config.BROWSER_ENABLED = enable
+    if admin_only is not None:
+        config.BROWSER_ADMIN_ONLY = admin_only
+    config.save_settings()
+    logger.info("⚙️ 瀏覽器操作: %s（僅管理員=%s）│ 設定者: %s",
+                enable, config.BROWSER_ADMIN_ONLY, ctx.author.display_name)
+
+    if not enable:
+        await browser.shutdown()
+
+    allow = config.BROWSER_ALLOW_DOMAINS
+    await ctx.respond(
+        embed=discord.Embed(
+            title="⚙️ 瀏覽器操作設定",
+            description=(
+                (
+                    "已**開啟**。奈奈可以用 `/browse` 或直接被交代（「幫我掛…」）"
+                    "去操作網站，做完傳截圖回來。\n\n"
+                    f"• 使用權限：{'🔒 只有管理員' if config.BROWSER_ADMIN_ONLY else '👥 所有人'}\n"
+                    f"• 可去的網站：{'、'.join(allow) if allow else '除內網以外都可以'}\n"
+                    f"• 一個任務上限 {config.BROWSER_MAX_STEPS} 步 / "
+                    f"{config.BROWSER_MAX_SECONDS} 秒，同時最多 "
+                    f"{config.BROWSER_MAX_SESSIONS} 個人在用\n"
+                    "• **送出／付款／掛號這類按鈕一定先問本人**才會按\n"
+                    "• 身分證、生日這種資料只會用本人給的，不會自己編\n"
+                    "• 內網網址一律不去；遇到驗證碼或要登入會停下來交還給本人"
+                )
+                if enable else
+                "已**關閉**瀏覽器操作，並收掉所有還開著的瀏覽器。"
+            ),
+            color=0x00CC66,
+        ),
+        ephemeral=True,
+    )
+
+
 @settings_group.command(name="reaction_follow", description="設定奈奈要不要跟著別人按表情 🫱")
 @discord.default_permissions(administrator=True)
 @discord.option("enable", type=bool, description="True (別人按了就跟著按同一個) 或 False (不跟)")
@@ -1816,6 +3197,74 @@ async def _flash_speaking(vc, times: int = 2) -> None:
         logger.debug("閃燈失敗（忽略）：%s", e)
 
 
+def _vc_for_user(user_id: int):
+    """找出「這個人在、奈奈也在」的那個語音頻道。"""
+    for vc in bot.voice_clients:
+        ch = getattr(vc, "channel", None)
+        if ch and any(m.id == user_id for m in getattr(ch, "members", [])):
+            return vc
+    return None
+
+
+def browser_sound_on(vc) -> bool:
+    return isinstance(getattr(vc, "source", None), MixedAudioSource)
+
+
+async def set_browser_sound(user_id: int, on: bool) -> str:
+    """把瀏覽器的聲音接進語音頻道／收掉。回傳給人看的一句話。"""
+    vc = _vc_for_user(user_id)
+    if vc is None:
+        return "你要先跟我在同一個語音頻道裡（用 `/join` 叫我進去）才聽得到 🎙️"
+
+    if not on:
+        if browser_sound_on(vc):
+            vc.stop()          # 停掉混音；她要說話時 play monitor 會自己重新 play
+        return "瀏覽器的聲音關掉了"
+
+    if browser_sound_on(vc):
+        return "已經在放了 🔊"
+    if not await audio_sink.ensure():
+        return "這台機器的音效環境起不來，沒辦法給聲音（要 pipewire）"
+
+    try:
+        # 從假裝置的 monitor 錄 —— 沒有聲音在播的時候它就是一片靜音，不會出錯
+        src = discord.FFmpegPCMAudio(
+            audio_sink.monitor_source(),
+            before_options="-f pulse -fflags nobuffer -flags low_delay",
+            options=None)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("🔊 開不了 ffmpeg：%s", e)
+        return f"開不了音訊來源：{str(e)[:100]}"
+
+    vc.stop()
+    vc.play(MixedAudioSource(src, AIAudioSource(bridge)))
+    logger.info("🔊 瀏覽器聲音已接進語音頻道 │ user=%d │ 頻道=%s",
+                user_id, getattr(vc.channel, "name", "?"))
+    return "接上了 —— 現在語音頻道聽得到瀏覽器的聲音 🔊"
+
+
+async def _remember_proactive(sent, user_id: int, trigger: str,
+                              msg: str, target) -> None:
+    """主動關心送出去之後的收尾：記住來源，並寫進對話歷史。
+
+    兩件事都是為了「對方回過來的時候她接得上」：
+      • proactive_sent：對方**回覆**那則訊息時，把當初的來源接回去
+        （session 可能早就過期了，所以這筆一定要落地）
+      • 對話歷史：對方在同一個頻道直接接話時，至少知道自己剛講過什麼
+    兩個都失敗也不能讓這則關心變成錯誤 —— 訊息已經送出去了。
+    """
+    try:
+        if sent is not None and trigger:
+            await reminders.remember_proactive(sent.id, user_id, trigger)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("記主動關心來源失敗（忽略）：%s", e)
+    try:
+        session = conv_manager.get_session(user_id, getattr(target, "id", 0))
+        session.add_message("assistant", msg)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("主動關心寫入對話歷史失敗（忽略）：%s", e)
+
+
 async def _ai_play_monitor(vc) -> None:
     """按需播放：只有奈奈真的有話要說時才 play，播完 source 回 b"" 自動停止。
 
@@ -1834,11 +3283,19 @@ async def _ai_play_monitor(vc) -> None:
 @bot.slash_command(name="join", description="加入你的語音頻道 🎙️")
 async def slash_join(ctx: discord.ApplicationContext):
     """加入語音頻道並啟動語音 AI"""
-    if not ctx.author.voice:
+    # 私訊裡 ctx.author 是 User 而不是 Member，而 User 沒有 .voice ——
+    # 直接讀會 AttributeError，指令整個爛掉（使用者只看到「應用程式沒有回應」）。
+    # 語音狀態是「伺服器裡」的概念，所以私訊要講清楚，不是丟一句請先加入語音頻道。
+    if ctx.guild is None:
+        await ctx.respond("❌ 語音頻道只有在伺服器裡才有喔，到伺服器再叫我 🎙️",
+                          ephemeral=True)
+        return
+    voice = getattr(ctx.author, "voice", None)
+    if not voice or not voice.channel:
         await ctx.respond("❌ 請先加入語音頻道！", ephemeral=True)
         return
 
-    channel = ctx.author.voice.channel
+    channel = voice.channel
     await ctx.defer()
 
     # 連接語音頻道（不自動重連，避免重啟後無限重試）
@@ -1887,6 +3344,20 @@ async def slash_join(ctx: discord.ApplicationContext):
     except Exception as e:
         logger.error("語音接收啟動失敗: %s", e)
         await ctx.followup.send(f"⚠️ 語音接收啟動失敗: {e}")
+
+
+@bot.slash_command(name="sound",
+                   description="把奈奈瀏覽器的聲音接進語音頻道 🔊（例如聽 YouTube）")
+@discord.option("開關", description="要開還是要關", choices=["開", "關"], default="開")
+async def slash_sound(ctx: discord.ApplicationContext, 開關: str = "開"):
+    """瀏覽器聲音的開關。
+
+    面板上也有同一顆鈕，但不是每個人都會開著操作台 ——
+    在頻道打一行字比較快。
+    """
+    await ctx.defer(ephemeral=True)
+    msg = await set_browser_sound(ctx.author.id, 開關 == "開")
+    await ctx.followup.send(msg, ephemeral=True)
 
 
 @bot.slash_command(name="leave", description="離開語音頻道 👋")
@@ -2095,6 +3566,28 @@ def build_help_embed() -> discord.Embed:
     )
 
     embed.add_field(
+        name="🌸 私人聊天室",
+        value=(
+            "• `/room open` — 開一間只有你和我的房間，**裡面不用 @我**，講什麼我都回\n"
+            "• `/room close` — 聊完關掉\n"
+            "• 敏感的事（身分證、病歷、心裡話）在裡面講比較安全"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🖥️ 幫你上網辦事",
+        value=(
+            "• `/browse` 或直接說「**幫我掛台大心臟科下週三下午**」\n"
+            "• 我會自己開瀏覽器點按鈕、填表單，做完**把畫面截圖傳給你**\n"
+            "• **送出前一定先問你**，你按確認我才按下去\n"
+            "• 身分證、生日這些我不會自己編，缺了會問你\n"
+            "• 遇到圖形驗證碼或要登入帳號，我會停下來把畫面給你接手"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
         name="⌨️ 斜線指令",
         value=(
             "• `/chat` — 和奈奈聊天\n"
@@ -2186,6 +3679,80 @@ async def send_long_message(
 # ═══════════════════════════════════════════════════════
 
 
+def _fmt_stats_block(d: dict[str, int]) -> str:
+    """把統計數字排成簡介裡的那一段。
+
+    只放「有發生過」的項目 —— 全新的機器人簡介上掛一排 0 很難看，
+    而且會讓人以為功能是壞的。
+    """
+    bits = []
+    if d["people"]:
+        bits.append(f"陪 {d['people']:,} 個人")
+    if d["messages"]:
+        bits.append(f"聊了 {d['messages']:,} 句")
+    if d["memories"]:
+        bits.append(f"記住 {d['memories']:,} 件事")
+    if d["cares"]:
+        bits.append(f"主動關心 {d['cares']:,} 次")
+    if d["reminders"]:
+        bits.append(f"提醒 {d['reminders']:,} 次")
+    if d["browse"]:
+        bits.append(f"上網幫忙 {d['browse']:,} 趟")
+    if d["reactions"]:
+        bits.append(f"貼了 {d['reactions']:,} 個表情")
+    if not bits:
+        return ""
+    return f"{config.PROFILE_STATS_MARK} " + "、".join(bits)
+
+
+# 固定的介紹文字。第一次更新時從 Discord 上現有的簡介讀回來（把統計那段切掉），
+# 之後每次更新都用它重新組 —— 不然統計會一段一段往後疊。
+_profile_base: str | None = None
+
+
+@tasks.loop(minutes=config.PROFILE_STATS_INTERVAL_MIN)
+async def update_profile_stats():
+    """把累計統計寫進機器人的簡介（個人資料那段描述）。"""
+    if not config.PROFILE_STATS_ENABLED:
+        return
+
+    global _profile_base
+    try:
+        headers = {"Authorization": f"Bot {config.DISCORD_TOKEN}"}
+        async with httpx.AsyncClient(timeout=20) as c:
+            if _profile_base is None:
+                r = await c.get("https://discord.com/api/v10/applications/@me",
+                                headers=headers)
+                if r.status_code != 200:
+                    logger.warning("📊 讀不到現在的簡介（%s），這次跳過", r.status_code)
+                    return
+                current = (r.json().get("description") or "").strip()
+                # 切掉上一次寫進去的統計，留下人寫的介紹文字
+                _profile_base = current.split(config.PROFILE_STATS_MARK)[0].rstrip()
+                logger.info("📊 簡介的固定內容記下來了（%d 字）", len(_profile_base))
+
+            block = _fmt_stats_block(stats.collect())
+            if not block:
+                return
+            desc = f"{_profile_base}\n\n{block}" if _profile_base else block
+            if len(desc) > config.PROFILE_MAX_LEN:
+                # 超過上限就砍統計那段，不要砍介紹 —— 介紹是人寫的，統計是附加的
+                room = config.PROFILE_MAX_LEN - len(_profile_base or "") - 2
+                if room < 20:
+                    logger.warning("📊 簡介本文已經佔滿 400 字，放不下統計")
+                    return
+                desc = f"{_profile_base}\n\n{block[:room - 1]}…"
+
+            r = await c.patch("https://discord.com/api/v10/applications/@me",
+                              headers=headers, json={"description": desc})
+            if r.status_code != 200:
+                logger.warning("📊 更新簡介失敗：%s %s", r.status_code, r.text[:200])
+                return
+        logger.info("📊 簡介統計已更新：%s", block)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("📊 更新簡介出錯（忽略）：%s", e)
+
+
 @tasks.loop(minutes=30)
 async def cleanup_sessions():
     count = conv_manager.cleanup_stale()
@@ -2242,8 +3809,12 @@ async def deliver_reminders():
                 if not msg:
                     logger.warning("💛 自動關心 #%d 生成失敗，跳過", rem.id)
                     continue
-                await target.send(f"<@{rem.user_id}> {msg}")
+                sent = await target.send(f"<@{rem.user_id}> {msg}")
                 await reminders.mark_proactive(rem.user_id)
+                # 記下「這句話是為了哪件事講的」。她被要求不要複述原話，所以
+                # 講出來會是「之前聽你提到那些說法」——對方回一句「哪些說法」時
+                # 沒有這筆對照，她就只能說「抱歉我沒對上訊號」（實際發生過）。
+                await _remember_proactive(sent, rem.user_id, rem.text, msg, target)
                 logger.info("💛 已送出自動關心 #%d", rem.id)
 
             elif rem.kind == "checkin":
@@ -2262,7 +3833,11 @@ async def deliver_reminders():
                 if not msg:
                     logger.warning("💛 主動關心 #%d 生成失敗，跳過", rem.id)
                     continue
-                await target.send(f"<@{rem.user_id}> {msg}")
+                sent = await target.send(f"<@{rem.user_id}> {msg}")
+                stats.bump(stats.CARES)
+                # 這條路沒有單一 trigger，改存當時手上的長期記憶摘要 ——
+                # 她那句開場白就是從這些東西想出來的
+                await _remember_proactive(sent, rem.user_id, mem_ctx, msg, target)
                 logger.info("💛 已送出主動關心 #%d", rem.id)
             else:
                 late = ""

@@ -5,5 +5,23 @@ venv/
 __pycache__/
 *.pyc
 *.db
+focus_review.db*
 logs/
 recordings/
+
+# npm 相依：package.json 和 lock 檔就夠了，1700 多個檔案不該進 repo
+activity/node_modules/
+
+# 隨手丟進專案目錄的截圖。**這條很重要**：那些是 Discord 的畫面截圖，
+# 裡面有其他人的暱稱和聊天內容，而這個 repo 是公開的。
+Screenshot_*.jpg
+Screenshot_*.png
+image*.png
+
+# 瀏覽器操作的錄影暫存
+*.webm
+
+# WAF 的修補腳本不要進這個公開 repo。裡面有叢集主節點的真實 IP、內部
+# attack_logs 編號、/opt/security-one-waf 的路徑、WAF 產品的原始碼副本，
+# 以及偵測器豁免條件的說明。那些東西該留在 WAF 自己的 repo 裡。
+waf-activity-patch/

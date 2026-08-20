@@ -7,3 +7,8 @@ python-dotenv>=1.0.0
 python-socketio[client]>=5.0
 websocket-client>=1.0
 numpy>=1.24
+
+# 瀏覽器操作（browser.py）
+# 裝完還要跑：playwright install chromium
+# 注意要用「跑 bot 的那個帳號」跑，瀏覽器是裝在該帳號的 ~/.cache/ms-playwright
+playwright>=1.55

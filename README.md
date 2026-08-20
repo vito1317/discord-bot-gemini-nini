@@ -27,6 +27,22 @@
 | `/leave` | — | 離開語音頻道 |
 | `/status` | — | 查看狀態 |
 
+### 🔎 重點關注訊息審核
+
+管理員可將成員加入重點關注名單。名單成員在伺服器內的訊息會立即移除，通過審核後才由機器人重新發佈。
+
+| 管理員指令 | 說明 |
+|---|---|
+| `/focus channel` | 設定接收審核卡片的管理員頻道 |
+| `/focus add` | 將成員加入重點關注名單 |
+| `/focus remove` | 將成員移出名單 |
+| `/focus mode` | 切換人工審核或 AI 審核 |
+| `/focus list` | 查看名單 |
+| `/focus pending` | 查看待人工審核佇列 |
+| `/focus panel` | 開啟互動式管理控制台 |
+
+AI 模式會自動核准或拒絕純文字訊息；模型無法使用或訊息含附件時，會安全地轉入人工審核。機器人需要「管理訊息」、「讀取訊息歷史」及「傳送訊息／嵌入連結／附加檔案」權限。
+
 ## 快速開始
 
 ### 前置需求
@@ -67,6 +83,7 @@ nana-bot/
 ├── config.py           # 設定載入
 ├── llm_client.py       # LM Studio API 客戶端
 ├── conversation.py     # 對話歷史管理
+├── focus_review.py     # 重點關注訊息審核與控制台
 ├── voice_bridge.py     # Freeze-Omni 語音橋接
 ├── requirements.txt    # Python 依賴
 ├── .env                # 環境變數（不入版控）
